@@ -151,6 +151,9 @@ define_class!(
                     if let Err(err) = state.open_path(path) {
                         state.last_error = Some(err.to_string());
                     }
+                } else {
+                    app.terminate(None);
+                    return;
                 }
             }
 
