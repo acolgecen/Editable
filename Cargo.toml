@@ -1,0 +1,17 @@
+[workspace]
+members = [
+    "app",
+    "csv-core",
+    "build-tools",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+authors = ["Editable contributors"]
+repository = ""
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+

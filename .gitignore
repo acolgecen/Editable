@@ -1,0 +1,6 @@
+/target/
+/.DS_Store
+/**/*.dSYM/
+/dist/
+/Editable.app/
+

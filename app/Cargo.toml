@@ -1,0 +1,17 @@
+[package]
+name = "editable"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+editable-csv-core = { path = "../csv-core" }
+objc2 = "0.6.4"
+objc2-app-kit = "0.3.2"
+objc2-foundation = "0.3.2"
+
+[[bin]]
+name = "editable"
+path = "src/main.rs"
+
