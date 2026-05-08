@@ -1,4 +1,4 @@
-use crate::selection::{Cell, RectSelection, Selection};
+use crate::selection::{Cell, Selection};
 use editable_csv_core::{ColumnFilter, CsvDocument, OpenOptions, Result, SortDirection, SortKey};
 use std::path::{Path, PathBuf};
 
@@ -187,12 +187,9 @@ impl EditableState {
                         doc.delete_column(column)?;
                     }
                 }
-                Selection::Cell(rect) => {
-                    let (top, left, bottom, right) = rect.bounds();
-                    for row in top..=bottom {
-                        for column in left..=right {
-                            doc.set_cell(row, column, "")?;
-                        }
+                Selection::Cells { .. } | Selection::Cell(_) => {
+                    for cell in self.selection.cells() {
+                        doc.set_cell(cell.row, cell.column, "")?;
                     }
                 }
                 Selection::All => {
@@ -271,7 +268,63 @@ impl EditableState {
     }
 
     pub fn select_cell(&mut self, row: usize, column: usize) {
-        self.selection = Selection::Cell(RectSelection::new(Cell { row, column }));
+        self.selection = Selection::single_cell(Cell { row, column });
+    }
+
+    pub fn toggle_cell_selection(&mut self, row: usize, column: usize) -> bool {
+        self.selection.toggle_cell(Cell { row, column })
+    }
+
+    pub fn set_cell_selection(&mut self, row: usize, column: usize, selected: bool) {
+        self.selection
+            .set_cell_selected(Cell { row, column }, selected);
+    }
+
+    pub fn select_cell_range_to(&mut self, row: usize, column: usize) {
+        self.selection.select_rect_to(Cell { row, column });
+    }
+
+    pub fn select_cell_range_from(&mut self, anchor: Cell, row: usize, column: usize) {
+        self.selection = Selection::single_cell(anchor);
+        self.selection.select_rect_to(Cell { row, column });
+    }
+
+    pub fn set_cell_range_selection(&mut self, row: usize, column: usize, selected: bool) {
+        let anchor = self.selection.anchor_cell();
+        self.selection
+            .set_rect_selected(anchor, Cell { row, column }, selected);
+    }
+
+    pub fn set_cell_range_selection_from(
+        &mut self,
+        anchor: Cell,
+        row: usize,
+        column: usize,
+        selected: bool,
+    ) {
+        self.selection
+            .set_rect_selected(anchor, Cell { row, column }, selected);
+    }
+
+    pub fn select_row(&mut self, row: usize) {
+        self.selection = Selection::Row {
+            anchor: row,
+            focus: row,
+        };
+    }
+
+    pub fn select_row_range_to(&mut self, row: usize) {
+        match &mut self.selection {
+            Selection::Row { focus, .. } => *focus = row,
+            _ => self.select_row(row),
+        }
+    }
+
+    pub fn select_column(&mut self, column: usize) {
+        self.selection = Selection::Column {
+            anchor: column,
+            focus: column,
+        };
     }
 
     pub fn save(&mut self, target: Option<PathBuf>) -> Result<()> {

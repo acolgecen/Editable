@@ -12,15 +12,16 @@ use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadOnly, Message};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSAutoresizingMaskOptions,
     NSBackingStoreType, NSBorderType, NSButton, NSButtonType, NSColor, NSControlStateValueOff,
-    NSControlStateValueOn, NSControlTextEditingDelegate, NSFont, NSScrollView, NSTableColumn,
-    NSTableView, NSTableViewColumnAutoresizingStyle, NSTableViewDataSource, NSTableViewDelegate,
-    NSTableViewGridLineStyle, NSTextAlignment, NSTextField, NSModalResponseOK, NSOpenPanel,
-    NSWindow, NSWindowDelegate, NSWindowStyleMask,
+    NSControlStateValueOn, NSControlTextEditingDelegate, NSEvent, NSEventModifierFlags, NSFont,
+    NSModalResponseOK, NSOpenPanel, NSScrollView, NSTableColumn, NSTableView,
+    NSTableViewColumnAutoresizingStyle, NSTableViewDataSource, NSTableViewDelegate,
+    NSTableViewGridLineStyle, NSTableViewSelectionHighlightStyle, NSTextAlignment, NSTextField,
+    NSTextFieldCell, NSWindow, NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{
-    MainThreadMarker, NSIndexSet, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect,
-    NSSize, NSString,
+    MainThreadMarker, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
 };
+use selection::Cell;
 use std::cell::{OnceCell, RefCell};
 use std::env;
 use std::path::PathBuf;
@@ -29,15 +30,82 @@ use std::ptr;
 const TOOLBAR_HEIGHT: f64 = 44.0;
 const STATUS_HEIGHT: f64 = 24.0;
 const MAX_VISIBLE_COLUMNS: usize = 1_024;
+const ROW_NUMBER_COLUMN: &str = "__row_number__";
+
+#[derive(Default)]
+struct TableIvars {
+    owner: OnceCell<*const Delegate>,
+}
+
+define_class!(
+    // SAFETY:
+    // - NSTableView supports subclassing for event handling.
+    // - Delegate owns the table, so the stored owner pointer is valid for the
+    //   lifetime of the table.
+    #[unsafe(super = NSTableView)]
+    #[thread_kind = MainThreadOnly]
+    #[ivars = TableIvars]
+    struct EditableTableView;
+
+    impl EditableTableView {
+        #[unsafe(method(mouseDown:))]
+        fn mouse_down(&self, event: &NSEvent) {
+            if let Some(owner) = self.owner() {
+                owner.table_mouse_down(self, event);
+            }
+        }
+
+        #[unsafe(method(mouseDragged:))]
+        fn mouse_dragged(&self, event: &NSEvent) {
+            if let Some(owner) = self.owner() {
+                owner.table_mouse_dragged(self, event);
+            }
+        }
+
+        #[unsafe(method(mouseUp:))]
+        fn mouse_up(&self, _event: &NSEvent) {
+            if let Some(owner) = self.owner() {
+                owner.table_mouse_up();
+            }
+        }
+    }
+);
+
+impl EditableTableView {
+    fn init_with_frame(mtm: MainThreadMarker, frame: NSRect) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(TableIvars::default());
+        unsafe { msg_send![super(this), initWithFrame: frame] }
+    }
+
+    fn set_owner(&self, owner: &Delegate) {
+        self.ivars().owner.set(owner as *const Delegate).ok();
+    }
+
+    fn owner(&self) -> Option<&Delegate> {
+        self.ivars()
+            .owner
+            .get()
+            .and_then(|owner| unsafe { owner.as_ref() })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DragSelection {
+    Cells { anchor: Cell },
+    Range { anchor: Cell, selected: bool },
+    ToggleCells { selected: bool, last: Cell },
+    Rows,
+}
 
 #[derive(Default)]
 struct AppDelegateIvars {
     window: OnceCell<Retained<NSWindow>>,
-    table: OnceCell<Retained<NSTableView>>,
+    table: OnceCell<Retained<EditableTableView>>,
     status: OnceCell<Retained<NSTextField>>,
     header_checkbox: OnceCell<Retained<NSButton>>,
     skip_field: OnceCell<Retained<NSTextField>>,
     filter_field: OnceCell<Retained<NSTextField>>,
+    drag_selection: RefCell<Option<DragSelection>>,
     state: RefCell<EditableState>,
 }
 
@@ -160,18 +228,25 @@ define_class!(
             table_column: Option<&NSTableColumn>,
             row: NSInteger,
         ) -> *mut AnyObject {
-            let Some(column) = table_column.and_then(visible_column_from_table_column) else {
-                return ptr::null_mut();
-            };
-            let value = self
-                .ivars()
-                .state
-                .borrow()
-                .document
-                .as_ref()
-                .and_then(|doc| doc.cell(row.max(0) as usize, column))
-                .unwrap_or_default();
-            Retained::autorelease_return(NSString::from_str(&value).into())
+            match table_column.and_then(visible_column_from_table_column) {
+                Some(VisibleColumn::RowNumber) => {
+                    return Retained::autorelease_return(
+                        NSString::from_str(&(row.max(0) + 1).to_string()).into(),
+                    );
+                }
+                Some(VisibleColumn::Data(column)) => {
+                    let value = self
+                        .ivars()
+                        .state
+                        .borrow()
+                        .document
+                        .as_ref()
+                        .and_then(|doc| doc.cell(row.max(0) as usize, column))
+                        .unwrap_or_default();
+                    Retained::autorelease_return(NSString::from_str(&value).into())
+                }
+                None => ptr::null_mut(),
+            }
         }
 
         #[unsafe(method(tableView:setObjectValue:forTableColumn:row:))]
@@ -182,7 +257,9 @@ define_class!(
             table_column: Option<&NSTableColumn>,
             row: NSInteger,
         ) {
-            let Some(column) = table_column.and_then(visible_column_from_table_column) else {
+            let Some(VisibleColumn::Data(column)) =
+                table_column.and_then(visible_column_from_table_column)
+            else {
                 return;
             };
             let value = object
@@ -204,14 +281,14 @@ define_class!(
     unsafe impl NSTableViewDelegate for Delegate {
         #[unsafe(method(tableViewSelectionDidChange:))]
         fn table_selection_changed(&self, _notification: &NSNotification) {
-            self.sync_selection_from_table();
+            // Selection is owned by EditableState; AppKit's row selection is suppressed.
         }
 
         #[unsafe(method(tableView:didClickTableColumn:))]
-        fn table_column_clicked(&self, table_view: &NSTableView, table_column: &NSTableColumn) {
-            if let Some(column) = visible_column_from_table_column(table_column) {
-                let row = table_view.selectedRow().max(0) as usize;
-                self.ivars().state.borrow_mut().select_cell(row, column);
+        fn table_column_clicked(&self, _table_view: &NSTableView, table_column: &NSTableColumn) {
+            if let Some(VisibleColumn::Data(column)) = visible_column_from_table_column(table_column) {
+                self.ivars().state.borrow_mut().select_column(column);
+                self.refresh_table();
             }
         }
 
@@ -231,13 +308,16 @@ define_class!(
             if column_index < 0 || new_column_index < 0 || column_index == new_column_index {
                 return false.into();
             }
+            if column_index == 0 || new_column_index == 0 {
+                return false.into();
+            }
             let result = self
                 .ivars()
                 .state
                 .borrow_mut()
                 .document
                 .as_mut()
-                .map(|doc| doc.reorder_column(column_index as usize, new_column_index as usize));
+                .map(|doc| doc.reorder_column(column_index as usize - 1, new_column_index as usize - 1));
             if let Some(result) = result {
                 self.handle_result(result);
             }
@@ -248,10 +328,48 @@ define_class!(
         fn should_edit(
             &self,
             _table_view: &NSTableView,
-            _table_column: Option<&NSTableColumn>,
+            table_column: Option<&NSTableColumn>,
             _row: NSInteger,
         ) -> bool {
-            true
+            matches!(
+                table_column.and_then(visible_column_from_table_column),
+                Some(VisibleColumn::Data(_))
+            )
+        }
+
+        #[unsafe(method(tableView:willDisplayCell:forTableColumn:row:))]
+        unsafe fn will_display_cell(
+            &self,
+            _table_view: &NSTableView,
+            cell: &AnyObject,
+            table_column: Option<&NSTableColumn>,
+            row: NSInteger,
+        ) {
+            let Some(text_cell) = cell.downcast_ref::<NSTextFieldCell>() else {
+                return;
+            };
+            let row = row.max(0) as usize;
+            let visible_column = table_column.and_then(visible_column_from_table_column);
+            let selected = match visible_column {
+                Some(VisibleColumn::RowNumber) => self.ivars().state.borrow().selection.contains_row(row),
+                Some(VisibleColumn::Data(column)) => {
+                    self.ivars().state.borrow().selection.contains_cell(row, column)
+                }
+                None => false,
+            };
+
+            if selected {
+                text_cell.setDrawsBackground(true);
+                text_cell.setBackgroundColor(Some(&NSColor::selectedTextBackgroundColor()));
+                text_cell.setTextColor(Some(&NSColor::alternateSelectedControlTextColor()));
+            } else if matches!(visible_column, Some(VisibleColumn::RowNumber)) {
+                text_cell.setDrawsBackground(true);
+                text_cell.setBackgroundColor(Some(&NSColor::controlBackgroundColor()));
+                text_cell.setTextColor(Some(&NSColor::secondaryLabelColor()));
+            } else {
+                text_cell.setDrawsBackground(false);
+                text_cell.setTextColor(Some(&NSColor::textColor()));
+            }
         }
     }
 
@@ -352,7 +470,6 @@ define_class!(
 
         #[unsafe(method(deleteSelection:))]
         fn delete_selection(&self, _sender: &AnyObject) {
-            self.sync_selection_from_table();
             let result = self.ivars().state.borrow_mut().delete_selection();
             self.handle_result(result);
             self.rebuild_columns();
@@ -407,12 +524,21 @@ define_class!(
             };
             let row = table.clickedRow();
             let column = table.clickedColumn();
-            if row >= 0 && column >= 0 {
+            let table_column = if column >= 0 {
+                table.tableColumns().objectAtIndex(column as NSUInteger)
+            } else {
+                return;
+            };
+            if row >= 0 {
+                let Some(VisibleColumn::Data(column)) = visible_column_from_table_column(&table_column)
+                else {
+                    return;
+                };
                 self.ivars()
                     .state
                     .borrow_mut()
                     .select_cell(row as usize, column as usize);
-                table.editColumn_row_withEvent_select(column, row, None, true);
+                table.editColumn_row_withEvent_select(column as NSInteger, row, None, true);
             }
         }
     }
@@ -447,12 +573,21 @@ impl Delegate {
         toolbar.addSubview(&header);
         self.ivars().header_checkbox.set(header).ok();
 
+        let skip_label = NSTextField::labelWithString(&NSString::from_str("Skip rows"), mtm);
+        skip_label.setFrame(NSRect::new(
+            NSPoint::new(110.0, 13.0),
+            NSSize::new(62.0, 18.0),
+        ));
+        skip_label.setTextColor(Some(&NSColor::secondaryLabelColor()));
+        skip_label.setFont(Some(&NSFont::systemFontOfSize(12.0)));
+        toolbar.addSubview(&skip_label);
+
         let skip = NSTextField::textFieldWithString(
             &NSString::from_str(&self.ivars().state.borrow().skip_rows.to_string()),
             mtm,
         );
         skip.setFrame(NSRect::new(
-            NSPoint::new(110.0, 10.0),
+            NSPoint::new(178.0, 10.0),
             NSSize::new(58.0, 24.0),
         ));
         skip.setPlaceholderString(Some(&NSString::from_str("Skip")));
@@ -465,7 +600,7 @@ impl Delegate {
 
         let filter = NSTextField::textFieldWithString(&NSString::from_str(""), mtm);
         filter.setFrame(NSRect::new(
-            NSPoint::new(182.0, 10.0),
+            NSPoint::new(250.0, 10.0),
             NSSize::new(170.0, 24.0),
         ));
         filter.setPlaceholderString(Some(&NSString::from_str("Filter active column")));
@@ -477,16 +612,16 @@ impl Delegate {
         self.ivars().filter_field.set(filter).ok();
 
         let controls = [
-            ("A-Z", sel!(sortAscending:), 366.0, 46.0),
-            ("Z-A", sel!(sortDescending:), 416.0, 46.0),
-            ("+ Row", sel!(addRow:), 478.0, 62.0),
-            ("+ Col", sel!(addColumn:), 544.0, 58.0),
-            ("Delete", sel!(deleteSelection:), 606.0, 66.0),
-            ("Row Up", sel!(rowUp:), 686.0, 68.0),
-            ("Row Down", sel!(rowDown:), 758.0, 82.0),
-            ("Col Left", sel!(columnLeft:), 854.0, 76.0),
-            ("Col Right", sel!(columnRight:), 934.0, 82.0),
-            ("Save", sel!(saveDocument:), 1030.0, 58.0),
+            ("A-Z", sel!(sortAscending:), 430.0, 46.0),
+            ("Z-A", sel!(sortDescending:), 480.0, 46.0),
+            ("+ Row", sel!(addRow:), 532.0, 56.0),
+            ("+ Col", sel!(addColumn:), 592.0, 54.0),
+            ("Delete", sel!(deleteSelection:), 650.0, 60.0),
+            ("Row Up", sel!(rowUp:), 718.0, 62.0),
+            ("Row Down", sel!(rowDown:), 784.0, 76.0),
+            ("Col Left", sel!(columnLeft:), 866.0, 70.0),
+            ("Col Right", sel!(columnRight:), 944.0, 76.0),
+            ("Save", sel!(saveDocument:), 1028.0, 54.0),
         ];
         for (title, action, x, width) in controls {
             toolbar.addSubview(&button(title, target, action, mtm, x, 10.0, width));
@@ -512,15 +647,18 @@ impl Delegate {
     }
 
     fn make_table_area(&self, mtm: MainThreadMarker) -> Retained<NSScrollView> {
-        let table = NSTableView::initWithFrame(
-            NSTableView::alloc(mtm),
+        let table = EditableTableView::init_with_frame(
+            mtm,
             NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1120.0, 672.0)),
         );
+        table.set_owner(self);
         table.setUsesAlternatingRowBackgroundColors(true);
-        table.setAllowsMultipleSelection(true);
-        table.setAllowsColumnSelection(true);
+        table.setAllowsEmptySelection(true);
+        table.setAllowsMultipleSelection(false);
+        table.setAllowsColumnSelection(false);
         table.setAllowsColumnReordering(true);
         table.setAllowsColumnResizing(true);
+        table.setSelectionHighlightStyle(NSTableViewSelectionHighlightStyle::None);
         table.setColumnAutoresizingStyle(NSTableViewColumnAutoresizingStyle::NoColumnAutoresizing);
         table.setGridStyleMask(
             NSTableViewGridLineStyle::SolidHorizontalGridLineMask
@@ -532,7 +670,6 @@ impl Delegate {
             table.setDataSource(Some(ProtocolObject::from_ref(self)));
             table.setDelegate(Some(ProtocolObject::from_ref(self)));
             table.setTarget(Some(any_ref(self)));
-            table.setDoubleAction(Some(sel!(editClickedCell:)));
         }
 
         let scroll = NSScrollView::initWithFrame(
@@ -566,6 +703,15 @@ impl Delegate {
             let column = columns.objectAtIndex(idx);
             table.removeTableColumn(&column);
         }
+
+        let row_identifier = NSString::from_str(ROW_NUMBER_COLUMN);
+        let row_column =
+            NSTableColumn::initWithIdentifier(NSTableColumn::alloc(mtm), &row_identifier);
+        row_column.setTitle(&NSString::from_str("#"));
+        row_column.setWidth(54.0);
+        row_column.setMinWidth(42.0);
+        row_column.setEditable(false);
+        table.addTableColumn(&row_column);
 
         let count = self
             .ivars()
@@ -608,35 +754,151 @@ impl Delegate {
         }
     }
 
-    fn sync_selection_from_table(&self) {
-        let Some(table) = self.ivars().table.get() else {
-            return;
-        };
-        let row = table.selectedRow();
-        let column = table.selectedColumn();
-        if row >= 0 && column >= 0 {
-            self.ivars()
-                .state
-                .borrow_mut()
-                .select_cell(row as usize, column as usize);
-        }
-    }
-
     fn restore_selection(&self) {
         let Some(table) = self.ivars().table.get() else {
             return;
         };
+        unsafe { table.deselectAll(None) };
         let active = self.ivars().state.borrow().selection.active_cell();
         if table.numberOfRows() > active.row as NSInteger {
-            let row = NSIndexSet::indexSetWithIndex(active.row as NSUInteger);
-            table.selectRowIndexes_byExtendingSelection(&row, false);
             table.scrollRowToVisible(active.row as NSInteger);
         }
-        if table.numberOfColumns() > active.column as NSInteger {
-            let column = NSIndexSet::indexSetWithIndex(active.column as NSUInteger);
-            table.selectColumnIndexes_byExtendingSelection(&column, false);
-            table.scrollColumnToVisible(active.column as NSInteger);
+        let visible_column = active.column + 1;
+        if table.numberOfColumns() > visible_column as NSInteger {
+            table.scrollColumnToVisible(visible_column as NSInteger);
         }
+    }
+
+    fn table_mouse_down(&self, table: &EditableTableView, event: &NSEvent) {
+        let Some(hit) = table_hit(table, event) else {
+            return;
+        };
+        let modifiers = event.modifierFlags();
+        match hit {
+            TableHit::RowNumber(row) => {
+                let mut state = self.ivars().state.borrow_mut();
+                if modifiers.contains(NSEventModifierFlags::Shift) {
+                    state.select_row_range_to(row);
+                } else {
+                    state.select_row(row);
+                }
+                self.ivars()
+                    .drag_selection
+                    .replace(Some(DragSelection::Rows));
+            }
+            TableHit::Data { cell, table_column } => {
+                if event.clickCount() >= 2 {
+                    self.ivars()
+                        .state
+                        .borrow_mut()
+                        .select_cell(cell.row, cell.column);
+                    table.reloadData();
+                    table.editColumn_row_withEvent_select(
+                        table_column,
+                        cell.row as NSInteger,
+                        Some(event),
+                        true,
+                    );
+                    self.ivars().drag_selection.replace(None);
+                    return;
+                }
+
+                if modifiers.contains(NSEventModifierFlags::Command) {
+                    let selected = self
+                        .ivars()
+                        .state
+                        .borrow_mut()
+                        .toggle_cell_selection(cell.row, cell.column);
+                    self.ivars()
+                        .drag_selection
+                        .replace(Some(DragSelection::ToggleCells {
+                            selected,
+                            last: cell,
+                        }));
+                } else if modifiers.contains(NSEventModifierFlags::Shift) {
+                    let anchor = self.ivars().state.borrow().selection.anchor_cell();
+                    let selected = !self
+                        .ivars()
+                        .state
+                        .borrow()
+                        .selection
+                        .contains_cell(cell.row, cell.column);
+                    self.ivars()
+                        .state
+                        .borrow_mut()
+                        .set_cell_range_selection_from(anchor, cell.row, cell.column, selected);
+                    self.ivars()
+                        .drag_selection
+                        .replace(Some(DragSelection::Range { anchor, selected }));
+                } else {
+                    self.ivars()
+                        .state
+                        .borrow_mut()
+                        .select_cell(cell.row, cell.column);
+                    self.ivars()
+                        .drag_selection
+                        .replace(Some(DragSelection::Cells { anchor: cell }));
+                }
+            }
+        }
+        table.reloadData();
+        self.update_status();
+    }
+
+    fn table_mouse_dragged(&self, table: &EditableTableView, event: &NSEvent) {
+        let Some(hit) = table_hit(table, event) else {
+            return;
+        };
+        let Some(drag) = *self.ivars().drag_selection.borrow() else {
+            return;
+        };
+        match (drag, hit) {
+            (
+                DragSelection::Rows,
+                TableHit::RowNumber(row)
+                | TableHit::Data {
+                    cell: Cell { row, .. },
+                    ..
+                },
+            ) => {
+                self.ivars().state.borrow_mut().select_row_range_to(row);
+            }
+            (DragSelection::Cells { anchor }, TableHit::Data { cell, .. }) => {
+                self.ivars().state.borrow_mut().select_cell_range_from(
+                    anchor,
+                    cell.row,
+                    cell.column,
+                );
+            }
+            (DragSelection::Range { anchor, selected }, TableHit::Data { cell, .. }) => {
+                self.ivars()
+                    .state
+                    .borrow_mut()
+                    .set_cell_range_selection_from(anchor, cell.row, cell.column, selected);
+            }
+            (DragSelection::ToggleCells { selected, last }, TableHit::Data { cell, .. }) => {
+                if cell != last {
+                    self.ivars().state.borrow_mut().set_cell_selection(
+                        cell.row,
+                        cell.column,
+                        selected,
+                    );
+                    self.ivars()
+                        .drag_selection
+                        .replace(Some(DragSelection::ToggleCells {
+                            selected,
+                            last: cell,
+                        }));
+                }
+            }
+            _ => {}
+        }
+        table.reloadData();
+        self.update_status();
+    }
+
+    fn table_mouse_up(&self) {
+        self.ivars().drag_selection.replace(None);
     }
 
     fn handle_result(&self, result: editable_csv_core::Result<()>) {
@@ -648,12 +910,50 @@ impl Delegate {
     }
 }
 
-fn visible_column_from_table_column(table_column: &NSTableColumn) -> Option<usize> {
-    table_column
-        .identifier()
-        .to_string()
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VisibleColumn {
+    RowNumber,
+    Data(usize),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TableHit {
+    RowNumber(usize),
+    Data { cell: Cell, table_column: NSInteger },
+}
+
+fn table_hit(table: &EditableTableView, event: &NSEvent) -> Option<TableHit> {
+    let point = table.convertPoint_fromView(event.locationInWindow(), None);
+    let row = table.rowAtPoint(point);
+    let table_column = table.columnAtPoint(point);
+    if row < 0 || table_column < 0 {
+        return None;
+    }
+
+    let column = table
+        .tableColumns()
+        .objectAtIndex(table_column as NSUInteger);
+    match visible_column_from_table_column(&column)? {
+        VisibleColumn::RowNumber => Some(TableHit::RowNumber(row as usize)),
+        VisibleColumn::Data(column) => Some(TableHit::Data {
+            cell: Cell {
+                row: row as usize,
+                column,
+            },
+            table_column,
+        }),
+    }
+}
+
+fn visible_column_from_table_column(table_column: &NSTableColumn) -> Option<VisibleColumn> {
+    let identifier = table_column.identifier().to_string();
+    if identifier == ROW_NUMBER_COLUMN {
+        return Some(VisibleColumn::RowNumber);
+    }
+    identifier
         .strip_prefix("c:")
         .and_then(|value| value.parse::<usize>().ok())
+        .map(VisibleColumn::Data)
 }
 
 fn launch_path_arg() -> Option<PathBuf> {
@@ -674,7 +974,9 @@ fn choose_startup_file(mtm: MainThreadMarker) -> Option<PathBuf> {
     panel.setAllowsMultipleSelection(false);
     panel.setResolvesAliases(true);
     panel.setTitle(Some(&NSString::from_str("Open File")));
-    panel.setMessage(Some(&NSString::from_str("Choose a file to open in Editable.")));
+    panel.setMessage(Some(&NSString::from_str(
+        "Choose a file to open in Editable.",
+    )));
     panel.setPrompt(Some(&NSString::from_str("Open")));
 
     if panel.runModal() == NSModalResponseOK {
