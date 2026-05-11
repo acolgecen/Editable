@@ -10,7 +10,8 @@ mod parser;
 
 pub use dialect::{detect_dialect, CsvDialect, Encoding, LineEnding};
 pub use document::{
-    CellCoord, ColumnFilter, CsvDocument, EditStats, OpenOptions, SortDirection, SortKey,
+    CellCoord, ColumnFilter, CsvDocument, EditStats, FilterOperator, FilterRule, OpenOptions,
+    SortDirection, SortKey,
 };
 pub use error::{CsvError, Result};
 pub use parser::{FieldIndex, RecordIndex};

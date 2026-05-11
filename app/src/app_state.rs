@@ -1,5 +1,7 @@
 use crate::selection::{Cell, Selection};
-use editable_csv_core::{ColumnFilter, CsvDocument, OpenOptions, Result, SortDirection, SortKey};
+use editable_csv_core::{
+    ColumnFilter, CsvDocument, FilterRule, OpenOptions, Result, SortDirection, SortKey,
+};
 use std::path::{Path, PathBuf};
 
 pub struct EditableState {
@@ -207,6 +209,33 @@ impl EditableState {
         if let Some(doc) = &mut self.document {
             doc.sort_by(vec![SortKey { column, direction }])?;
         }
+        Ok(())
+    }
+
+    pub fn sort_keys(&self) -> Vec<SortKey> {
+        self.document
+            .as_ref()
+            .map(CsvDocument::sort_keys)
+            .unwrap_or_default()
+    }
+
+    pub fn filter_rules(&self) -> Vec<FilterRule> {
+        self.document
+            .as_ref()
+            .map(CsvDocument::filter_rules)
+            .unwrap_or_default()
+    }
+
+    pub fn apply_sort_filter_rules(
+        &mut self,
+        sort_keys: Vec<SortKey>,
+        filter_rules: Vec<FilterRule>,
+    ) -> Result<()> {
+        if let Some(doc) = &mut self.document {
+            doc.set_filter_rules(filter_rules)?;
+            doc.sort_by(sort_keys)?;
+        }
+        self.filter_text.clear();
         Ok(())
     }
 

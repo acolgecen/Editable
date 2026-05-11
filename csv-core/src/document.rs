@@ -49,6 +49,29 @@ pub enum ColumnFilter {
     NotEmpty,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterOperator {
+    Contains,
+    DoesNotContain,
+    Equals,
+    DoesNotEqual,
+    StartsWith,
+    EndsWith,
+    GreaterThan,
+    GreaterThanOrEqual,
+    LessThan,
+    LessThanOrEqual,
+    IsEmpty,
+    IsNotEmpty,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilterRule {
+    pub column: usize,
+    pub operator: FilterOperator,
+    pub value: String,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct EditStats {
     pub edited_cells: usize,
@@ -87,7 +110,7 @@ pub struct CsvDocument {
     deleted_rows: HashSet<usize>,
     deleted_columns: HashSet<usize>,
     edits: HashMap<CellCoord, String>,
-    filters: HashMap<usize, ColumnFilter>,
+    filters: Vec<FilterRule>,
     sort_keys: Vec<SortKey>,
     dirty: bool,
 }
@@ -146,7 +169,7 @@ impl CsvDocument {
             deleted_rows: HashSet::new(),
             deleted_columns: HashSet::new(),
             edits: HashMap::new(),
-            filters: HashMap::new(),
+            filters: Vec::new(),
             sort_keys: Vec::new(),
             dirty: false,
         })
@@ -333,13 +356,43 @@ impl CsvDocument {
         let real_column = self
             .real_column(column)
             .ok_or(CsvError::InvalidColumn { column })?;
+        self.filters.retain(|rule| rule.column != real_column);
         if let Some(filter) = filter {
-            self.filters.insert(real_column, filter);
-        } else {
-            self.filters.remove(&real_column);
+            self.filters.push(legacy_filter_rule(real_column, filter));
         }
         self.refresh_view();
         Ok(())
+    }
+
+    pub fn set_filter_rules(&mut self, rules: Vec<FilterRule>) -> Result<()> {
+        let mut real_rules = Vec::with_capacity(rules.len());
+        for rule in rules {
+            let Some(real_column) = self.real_column(rule.column) else {
+                return Err(CsvError::InvalidColumn {
+                    column: rule.column,
+                });
+            };
+            real_rules.push(FilterRule {
+                column: real_column,
+                ..rule
+            });
+        }
+        self.filters = real_rules;
+        self.refresh_view();
+        Ok(())
+    }
+
+    pub fn filter_rules(&self) -> Vec<FilterRule> {
+        self.filters
+            .iter()
+            .filter_map(|rule| {
+                self.visible_column(rule.column).map(|column| FilterRule {
+                    column,
+                    operator: rule.operator,
+                    value: rule.value.clone(),
+                })
+            })
+            .collect()
     }
 
     pub fn sort_by(&mut self, keys: Vec<SortKey>) -> Result<()> {
@@ -356,6 +409,18 @@ impl CsvDocument {
         self.sort_keys = real_keys;
         self.refresh_view();
         Ok(())
+    }
+
+    pub fn sort_keys(&self) -> Vec<SortKey> {
+        self.sort_keys
+            .iter()
+            .filter_map(|key| {
+                self.visible_column(key.column).map(|column| SortKey {
+                    column,
+                    direction: key.direction,
+                })
+            })
+            .collect()
     }
 
     pub fn save_to(&self, path: impl AsRef<Path>) -> Result<()> {
@@ -431,14 +496,9 @@ impl CsvDocument {
     }
 
     fn row_matches_filters(&self, data_row: usize) -> bool {
-        self.filters.iter().all(|(column, filter)| {
-            let value = self.cell_from_data_row(data_row, *column);
-            match filter {
-                ColumnFilter::Contains(needle) => value.contains(needle),
-                ColumnFilter::Equals(expected) => value == *expected,
-                ColumnFilter::Empty => value.is_empty(),
-                ColumnFilter::NotEmpty => !value.is_empty(),
-            }
+        self.filters.iter().all(|rule| {
+            let value = self.cell_from_data_row(data_row, rule.column);
+            rule_matches_value(rule, &value)
         })
     }
 
@@ -446,7 +506,17 @@ impl CsvDocument {
         for key in keys {
             let left_value = self.cell_from_data_row(left, key.column);
             let right_value = self.cell_from_data_row(right, key.column);
-            let ordering = naturalish_cmp(&left_value, &right_value);
+            let left_null = left_value.is_empty();
+            let right_null = right_value.is_empty();
+            let ordering = match (left_null, right_null) {
+                (true, false) => Ordering::Greater,
+                (false, true) => Ordering::Less,
+                (true, true) => Ordering::Equal,
+                (false, false) => naturalish_cmp(&left_value, &right_value),
+            };
+            if ordering != Ordering::Equal && (left_null || right_null) {
+                return ordering;
+            }
             let ordering = match key.direction {
                 SortDirection::Ascending => ordering,
                 SortDirection::Descending => ordering.reverse(),
@@ -478,6 +548,85 @@ impl CsvDocument {
             .copied()
             .filter(|column| !self.deleted_columns.contains(column))
             .nth(visible_column)
+    }
+
+    fn visible_column(&self, real_column: usize) -> Option<usize> {
+        self.column_order
+            .iter()
+            .copied()
+            .filter(|column| !self.deleted_columns.contains(column))
+            .position(|column| column == real_column)
+    }
+}
+
+fn legacy_filter_rule(column: usize, filter: ColumnFilter) -> FilterRule {
+    match filter {
+        ColumnFilter::Contains(value) => FilterRule {
+            column,
+            operator: FilterOperator::Contains,
+            value,
+        },
+        ColumnFilter::Equals(value) => FilterRule {
+            column,
+            operator: FilterOperator::Equals,
+            value,
+        },
+        ColumnFilter::Empty => FilterRule {
+            column,
+            operator: FilterOperator::IsEmpty,
+            value: String::new(),
+        },
+        ColumnFilter::NotEmpty => FilterRule {
+            column,
+            operator: FilterOperator::IsNotEmpty,
+            value: String::new(),
+        },
+    }
+}
+
+fn rule_matches_value(rule: &FilterRule, value: &str) -> bool {
+    match rule.operator {
+        FilterOperator::IsEmpty => value.is_empty(),
+        FilterOperator::IsNotEmpty => !value.is_empty(),
+        FilterOperator::Contains => {
+            text_match(rule, value, |value, pattern| value.contains(pattern))
+        }
+        FilterOperator::DoesNotContain => {
+            !text_match(rule, value, |value, pattern| value.contains(pattern))
+        }
+        FilterOperator::Equals => text_match(rule, value, |value, pattern| value == pattern),
+        FilterOperator::DoesNotEqual => !text_match(rule, value, |value, pattern| value == pattern),
+        FilterOperator::StartsWith => {
+            text_match(rule, value, |value, pattern| value.starts_with(pattern))
+        }
+        FilterOperator::EndsWith => {
+            text_match(rule, value, |value, pattern| value.ends_with(pattern))
+        }
+        FilterOperator::GreaterThan => {
+            compare_filter_value(value, &rule.value) == Some(Ordering::Greater)
+        }
+        FilterOperator::GreaterThanOrEqual => matches!(
+            compare_filter_value(value, &rule.value),
+            Some(Ordering::Greater | Ordering::Equal)
+        ),
+        FilterOperator::LessThan => {
+            compare_filter_value(value, &rule.value) == Some(Ordering::Less)
+        }
+        FilterOperator::LessThanOrEqual => matches!(
+            compare_filter_value(value, &rule.value),
+            Some(Ordering::Less | Ordering::Equal)
+        ),
+    }
+}
+
+fn text_match(rule: &FilterRule, value: &str, plain: impl Fn(&str, &str) -> bool) -> bool {
+    plain(value, &rule.value)
+}
+
+fn compare_filter_value(value: &str, expected: &str) -> Option<Ordering> {
+    match (value.parse::<f64>(), expected.parse::<f64>()) {
+        (Ok(value), Ok(expected)) => value.partial_cmp(&expected),
+        _ => Some(value.to_lowercase().cmp(&expected.to_lowercase())),
     }
 }
 
@@ -551,6 +700,54 @@ mod tests {
         .unwrap();
         assert_eq!(doc.cell(0, 0).unwrap(), "C");
         assert_eq!(doc.cell(2, 0).unwrap(), "A");
+    }
+
+    #[test]
+    fn empty_values_sort_last_in_both_directions() {
+        let mut doc = CsvDocument::from_bytes(
+            b"name,score\nBlank,\nLow,1\nHigh,9\n".to_vec(),
+            OpenOptions::default(),
+        )
+        .unwrap();
+        doc.sort_by(vec![SortKey {
+            column: 1,
+            direction: SortDirection::Ascending,
+        }])
+        .unwrap();
+        assert_eq!(doc.cell(0, 0).unwrap(), "Low");
+        assert_eq!(doc.cell(2, 0).unwrap(), "Blank");
+
+        doc.sort_by(vec![SortKey {
+            column: 1,
+            direction: SortDirection::Descending,
+        }])
+        .unwrap();
+        assert_eq!(doc.cell(0, 0).unwrap(), "High");
+        assert_eq!(doc.cell(2, 0).unwrap(), "Blank");
+    }
+
+    #[test]
+    fn multiple_filter_rules_can_use_text_and_comparisons() {
+        let mut doc = CsvDocument::from_bytes(
+            b"name,age\nAda,36\nGrace,85\nAlan,41\n".to_vec(),
+            OpenOptions::default(),
+        )
+        .unwrap();
+        doc.set_filter_rules(vec![
+            FilterRule {
+                column: 0,
+                operator: FilterOperator::StartsWith,
+                value: "A".to_string(),
+            },
+            FilterRule {
+                column: 1,
+                operator: FilterOperator::GreaterThan,
+                value: "40".to_string(),
+            },
+        ])
+        .unwrap();
+        assert_eq!(doc.row_count(), 1);
+        assert_eq!(doc.cell(0, 0).unwrap(), "Alan");
     }
 
     #[test]

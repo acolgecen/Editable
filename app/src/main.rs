@@ -4,7 +4,7 @@ mod app_state;
 mod selection;
 
 use app_state::EditableState;
-use editable_csv_core::SortDirection;
+use editable_csv_core::{FilterOperator, FilterRule, SortDirection, SortKey};
 use objc2::ffi::{NSInteger, NSUInteger};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, Bool, ProtocolObject};
@@ -13,10 +13,11 @@ use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSAutoresizingMaskOptions,
     NSBackingStoreType, NSBorderType, NSButton, NSButtonType, NSColor, NSControlStateValueOff,
     NSControlStateValueOn, NSControlTextEditingDelegate, NSEvent, NSEventModifierFlags, NSFont,
-    NSModalResponseOK, NSOpenPanel, NSScrollView, NSTableColumn, NSTableView,
-    NSTableViewColumnAutoresizingStyle, NSTableViewDataSource, NSTableViewDelegate,
-    NSTableViewGridLineStyle, NSTableViewSelectionHighlightStyle, NSTextAlignment, NSTextField,
-    NSTextFieldCell, NSWindow, NSWindowDelegate, NSWindowStyleMask,
+    NSModalResponseCancel, NSModalResponseOK, NSOpenPanel, NSPopUpButton, NSScrollView,
+    NSTableColumn, NSTableView, NSTableViewColumnAutoresizingStyle, NSTableViewDataSource,
+    NSTableViewDelegate, NSTableViewGridLineStyle, NSTableViewSelectionHighlightStyle,
+    NSTextAlignment, NSTextField, NSTextFieldCell, NSView, NSWindow, NSWindowDelegate,
+    NSWindowStyleMask,
 };
 use objc2_foundation::{
     MainThreadMarker, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
@@ -97,6 +98,24 @@ enum DragSelection {
     Rows,
 }
 
+struct SortRuleControls {
+    column: Retained<NSPopUpButton>,
+    direction: Retained<NSPopUpButton>,
+}
+
+struct FilterRuleControls {
+    column: Retained<NSPopUpButton>,
+    operator: Retained<NSPopUpButton>,
+    value: Retained<NSTextField>,
+}
+
+struct SortFilterPanel {
+    window: Retained<NSWindow>,
+    sort_rows: Vec<SortRuleControls>,
+    filter_rows: Vec<FilterRuleControls>,
+    error_label: Retained<NSTextField>,
+}
+
 #[derive(Default)]
 struct AppDelegateIvars {
     window: OnceCell<Retained<NSWindow>>,
@@ -104,7 +123,7 @@ struct AppDelegateIvars {
     status: OnceCell<Retained<NSTextField>>,
     header_checkbox: OnceCell<Retained<NSButton>>,
     skip_field: OnceCell<Retained<NSTextField>>,
-    filter_field: OnceCell<Retained<NSTextField>>,
+    sort_filter_panel: RefCell<Option<SortFilterPanel>>,
     drag_selection: RefCell<Option<DragSelection>>,
     state: RefCell<EditableState>,
 }
@@ -434,6 +453,99 @@ define_class!(
             self.refresh_table();
         }
 
+        #[unsafe(method(openSortFilter:))]
+        fn open_sort_filter(&self, _sender: &AnyObject) {
+            self.present_sort_filter_panel();
+        }
+
+        #[unsafe(method(addSortRule:))]
+        fn add_sort_rule(&self, _sender: &AnyObject) {
+            let (mut sorts, filters) = self.collect_sort_filter_draft();
+            let active_column = self.ivars().state.borrow().selection.active_cell().column;
+            sorts.push(SortKey {
+                column: active_column,
+                direction: SortDirection::Ascending,
+            });
+            self.rebuild_sort_filter_panel(sorts, filters, "");
+        }
+
+        #[unsafe(method(addFilterRule:))]
+        fn add_filter_rule(&self, _sender: &AnyObject) {
+            let (sorts, mut filters) = self.collect_sort_filter_draft();
+            let active_column = self.ivars().state.borrow().selection.active_cell().column;
+            filters.push(FilterRule {
+                column: active_column,
+                operator: FilterOperator::Contains,
+                value: String::new(),
+            });
+            self.rebuild_sort_filter_panel(sorts, filters, "");
+        }
+
+        #[unsafe(method(deleteSortRule:))]
+        fn delete_sort_rule(&self, sender: &AnyObject) {
+            let index = sender
+                .downcast_ref::<NSButton>()
+                .map(|button| button.tag())
+                .unwrap_or(-1);
+            let (mut sorts, filters) = self.collect_sort_filter_draft();
+            if index >= 0 && (index as usize) < sorts.len() {
+                sorts.remove(index as usize);
+            }
+            self.rebuild_sort_filter_panel(sorts, filters, "");
+        }
+
+        #[unsafe(method(deleteFilterRule:))]
+        fn delete_filter_rule(&self, sender: &AnyObject) {
+            let index = sender
+                .downcast_ref::<NSButton>()
+                .map(|button| button.tag())
+                .unwrap_or(-1);
+            let (sorts, mut filters) = self.collect_sort_filter_draft();
+            if index >= 0 && (index as usize) < filters.len() {
+                filters.remove(index as usize);
+            }
+            self.rebuild_sort_filter_panel(sorts, filters, "");
+        }
+
+        #[unsafe(method(resetSorting:))]
+        fn reset_sorting(&self, _sender: &AnyObject) {
+            let (_, filters) = self.collect_sort_filter_draft();
+            self.rebuild_sort_filter_panel(Vec::new(), filters, "");
+        }
+
+        #[unsafe(method(resetFilters:))]
+        fn reset_filters(&self, _sender: &AnyObject) {
+            let (sorts, _) = self.collect_sort_filter_draft();
+            self.rebuild_sort_filter_panel(sorts, Vec::new(), "");
+        }
+
+        #[unsafe(method(doneSortFilter:))]
+        fn done_sort_filter(&self, _sender: &AnyObject) {
+            let (sorts, filters) = self.collect_sort_filter_draft();
+            let result = self
+                .ivars()
+                .state
+                .borrow_mut()
+                .apply_sort_filter_rules(sorts, filters);
+            if let Err(err) = result {
+                if let Some(panel) = self.ivars().sort_filter_panel.borrow().as_ref() {
+                    panel
+                        .error_label
+                        .setStringValue(&NSString::from_str(&err.to_string()));
+                }
+                self.ivars().state.borrow_mut().last_error = Some(err.to_string());
+                return;
+            }
+            self.ivars().state.borrow_mut().last_error = None;
+            self.refresh_table();
+            NSApplication::sharedApplication(self.mtm()).stopModalWithCode(NSModalResponseOK);
+        }
+
+        #[unsafe(method(cancelSortFilter:))]
+        fn cancel_sort_filter(&self, _sender: &AnyObject) {
+            NSApplication::sharedApplication(self.mtm()).stopModalWithCode(NSModalResponseCancel);
+        }
+
         #[unsafe(method(sortAscending:))]
         fn sort_ascending(&self, _sender: &AnyObject) {
             let result = self
@@ -601,30 +713,25 @@ impl Delegate {
         toolbar.addSubview(&skip);
         self.ivars().skip_field.set(skip).ok();
 
-        let filter = NSTextField::textFieldWithString(&NSString::from_str(""), mtm);
-        filter.setFrame(NSRect::new(
-            NSPoint::new(250.0, 10.0),
-            NSSize::new(170.0, 24.0),
+        toolbar.addSubview(&button(
+            "Sort/Filter",
+            target,
+            sel!(openSortFilter:),
+            mtm,
+            250.0,
+            10.0,
+            92.0,
         ));
-        filter.setPlaceholderString(Some(&NSString::from_str("Filter active column")));
-        unsafe {
-            filter.setTarget(Some(target));
-            filter.setAction(Some(sel!(applyFilter:)));
-        }
-        toolbar.addSubview(&filter);
-        self.ivars().filter_field.set(filter).ok();
 
         let controls = [
-            ("A-Z", sel!(sortAscending:), 430.0, 46.0),
-            ("Z-A", sel!(sortDescending:), 480.0, 46.0),
-            ("+ Row", sel!(addRow:), 532.0, 56.0),
-            ("+ Col", sel!(addColumn:), 592.0, 54.0),
-            ("Delete", sel!(deleteSelection:), 650.0, 60.0),
-            ("Row Up", sel!(rowUp:), 718.0, 62.0),
-            ("Row Down", sel!(rowDown:), 784.0, 76.0),
-            ("Col Left", sel!(columnLeft:), 866.0, 70.0),
-            ("Col Right", sel!(columnRight:), 944.0, 76.0),
-            ("Save", sel!(saveDocument:), 1028.0, 54.0),
+            ("+ Row", sel!(addRow:), 356.0, 56.0),
+            ("+ Col", sel!(addColumn:), 416.0, 54.0),
+            ("Delete", sel!(deleteSelection:), 474.0, 60.0),
+            ("Row Up", sel!(rowUp:), 542.0, 62.0),
+            ("Row Down", sel!(rowDown:), 608.0, 76.0),
+            ("Col Left", sel!(columnLeft:), 690.0, 70.0),
+            ("Col Right", sel!(columnRight:), 768.0, 76.0),
+            ("Save", sel!(saveDocument:), 852.0, 54.0),
         ];
         for (title, action, x, width) in controls {
             toolbar.addSubview(&button(title, target, action, mtm, x, 10.0, width));
@@ -694,6 +801,305 @@ impl Delegate {
 
         self.ivars().table.set(table).ok();
         scroll
+    }
+
+    fn present_sort_filter_panel(&self) {
+        let mtm = self.mtm();
+        let window = unsafe {
+            NSWindow::initWithContentRect_styleMask_backing_defer(
+                NSWindow::alloc(mtm),
+                NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(680.0, 390.0)),
+                NSWindowStyleMask::Titled,
+                NSBackingStoreType::Buffered,
+                false,
+            )
+        };
+        unsafe { window.setReleasedWhenClosed(false) };
+        window.setTitle(&NSString::from_str("Sort and Filter"));
+
+        let (sorts, filters) = {
+            let state = self.ivars().state.borrow();
+            (state.sort_keys(), state.filter_rules())
+        };
+        let panel = self.build_sort_filter_panel(window.clone(), sorts, filters, "");
+        self.ivars().sort_filter_panel.replace(Some(panel));
+
+        window.center();
+        window.makeKeyAndOrderFront(None);
+        NSApplication::sharedApplication(mtm).runModalForWindow(&window);
+        window.orderOut(None);
+        self.ivars().sort_filter_panel.replace(None);
+    }
+
+    fn rebuild_sort_filter_panel(
+        &self,
+        sort_rules: Vec<SortKey>,
+        filter_rules: Vec<FilterRule>,
+        error: &str,
+    ) {
+        let Some(window) = self
+            .ivars()
+            .sort_filter_panel
+            .borrow()
+            .as_ref()
+            .map(|panel| panel.window.clone())
+        else {
+            return;
+        };
+        let panel = self.build_sort_filter_panel(window, sort_rules, filter_rules, error);
+        self.ivars().sort_filter_panel.replace(Some(panel));
+    }
+
+    fn build_sort_filter_panel(
+        &self,
+        window: Retained<NSWindow>,
+        sort_rules: Vec<SortKey>,
+        filter_rules: Vec<FilterRule>,
+        error: &str,
+    ) -> SortFilterPanel {
+        let mtm = self.mtm();
+        let row_count = sort_rules.len().max(1) + filter_rules.len().max(1);
+        let height = (252.0 + row_count as f64 * 34.0).min(720.0).max(390.0);
+        window.setContentSize(NSSize::new(680.0, height));
+
+        let target = unsafe { any_ref(self) };
+        let content = NSView::initWithFrame(
+            NSView::alloc(mtm),
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(680.0, height)),
+        );
+        let columns = self.column_titles();
+        let mut y = height - 64.0;
+        content.addSubview(&section_label("Sorting", mtm, 24.0, y));
+        content.addSubview(&button(
+            "+",
+            target,
+            sel!(addSortRule:),
+            mtm,
+            526.0,
+            y - 4.0,
+            28.0,
+        ));
+        content.addSubview(&button(
+            "Reset sorting",
+            target,
+            sel!(resetSorting:),
+            mtm,
+            560.0,
+            y - 4.0,
+            96.0,
+        ));
+
+        y -= 34.0;
+        let mut sort_rows = Vec::new();
+        if sort_rules.is_empty() {
+            content.addSubview(&muted_label("No sort rules", mtm, 24.0, y + 4.0, 220.0));
+            y -= 34.0;
+        } else {
+            for (index, rule) in sort_rules.iter().enumerate() {
+                let column = popup(&columns, rule.column, mtm, 24.0, y, 270.0);
+                let direction = popup(
+                    &["Ascending".to_string(), "Descending".to_string()],
+                    match rule.direction {
+                        SortDirection::Ascending => 0,
+                        SortDirection::Descending => 1,
+                    },
+                    mtm,
+                    306.0,
+                    y,
+                    130.0,
+                );
+                let delete = button("Delete", target, sel!(deleteSortRule:), mtm, 584.0, y, 72.0);
+                delete.setTag(index as NSInteger);
+                content.addSubview(&column);
+                content.addSubview(&direction);
+                content.addSubview(&delete);
+                sort_rows.push(SortRuleControls { column, direction });
+                y -= 34.0;
+            }
+        }
+
+        y -= 12.0;
+        content.addSubview(&section_label("Filters", mtm, 24.0, y));
+        content.addSubview(&button(
+            "+",
+            target,
+            sel!(addFilterRule:),
+            mtm,
+            526.0,
+            y - 4.0,
+            28.0,
+        ));
+        content.addSubview(&button(
+            "Reset Filters",
+            target,
+            sel!(resetFilters:),
+            mtm,
+            560.0,
+            y - 4.0,
+            96.0,
+        ));
+
+        y -= 34.0;
+        let mut filter_rows = Vec::new();
+        if filter_rules.is_empty() {
+            content.addSubview(&muted_label("No filter rules", mtm, 24.0, y + 4.0, 220.0));
+        } else {
+            for (index, rule) in filter_rules.iter().enumerate() {
+                let column = popup(
+                    &columns,
+                    rule.column.min(columns.len().saturating_sub(1)),
+                    mtm,
+                    24.0,
+                    y,
+                    180.0,
+                );
+                let operator = popup(
+                    &filter_operator_titles(),
+                    filter_operator_index(rule.operator),
+                    mtm,
+                    216.0,
+                    y,
+                    154.0,
+                );
+                let value = NSTextField::textFieldWithString(&NSString::from_str(&rule.value), mtm);
+                value.setFrame(NSRect::new(
+                    NSPoint::new(382.0, y),
+                    NSSize::new(150.0, 24.0),
+                ));
+                value.setPlaceholderString(Some(&NSString::from_str("Value")));
+                let delete = button(
+                    "Delete",
+                    target,
+                    sel!(deleteFilterRule:),
+                    mtm,
+                    548.0,
+                    y,
+                    72.0,
+                );
+                delete.setTag(index as NSInteger);
+                content.addSubview(&column);
+                content.addSubview(&operator);
+                content.addSubview(&value);
+                content.addSubview(&delete);
+                filter_rows.push(FilterRuleControls {
+                    column,
+                    operator,
+                    value,
+                });
+                y -= 34.0;
+            }
+        }
+
+        let error_label = muted_label(error, mtm, 24.0, 58.0, 450.0);
+        error_label.setTextColor(Some(&NSColor::systemRedColor()));
+        content.addSubview(&error_label);
+
+        let cancel = button(
+            "Cancel",
+            target,
+            sel!(cancelSortFilter:),
+            mtm,
+            492.0,
+            24.0,
+            76.0,
+        );
+        let done = button(
+            "Done",
+            target,
+            sel!(doneSortFilter:),
+            mtm,
+            580.0,
+            24.0,
+            76.0,
+        );
+        done.setKeyEquivalent(&NSString::from_str("\r"));
+        cancel.setKeyEquivalent(&NSString::from_str("\u{1b}"));
+        content.addSubview(&cancel);
+        content.addSubview(&done);
+
+        if columns.is_empty() {
+            content.addSubview(&muted_label(
+                "Open a table with at least one column.",
+                mtm,
+                24.0,
+                height - 74.0,
+                300.0,
+            ));
+        }
+
+        window.setContentView(Some(&content));
+        SortFilterPanel {
+            window,
+            sort_rows,
+            filter_rows,
+            error_label,
+        }
+    }
+
+    fn collect_sort_filter_draft(&self) -> (Vec<SortKey>, Vec<FilterRule>) {
+        let panel_ref = self.ivars().sort_filter_panel.borrow();
+        let Some(panel) = panel_ref.as_ref() else {
+            return (Vec::new(), Vec::new());
+        };
+        let sorts = panel
+            .sort_rows
+            .iter()
+            .filter_map(|row| {
+                let column = row.column.indexOfSelectedItem();
+                if column < 0 {
+                    return None;
+                }
+                Some(SortKey {
+                    column: column as usize,
+                    direction: if row.direction.indexOfSelectedItem() == 1 {
+                        SortDirection::Descending
+                    } else {
+                        SortDirection::Ascending
+                    },
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let filters = panel
+            .filter_rows
+            .iter()
+            .filter_map(|row| {
+                let column = row.column.indexOfSelectedItem();
+                if column < 0 {
+                    return None;
+                }
+                let operator = filter_operator_at(row.operator.indexOfSelectedItem());
+                let value = row.value.stringValue().to_string();
+                if value.is_empty()
+                    && !matches!(
+                        operator,
+                        FilterOperator::IsEmpty | FilterOperator::IsNotEmpty
+                    )
+                {
+                    return None;
+                }
+                Some(FilterRule {
+                    column: column as usize,
+                    operator,
+                    value,
+                })
+            })
+            .collect::<Vec<_>>();
+        (sorts, filters)
+    }
+
+    fn column_titles(&self) -> Vec<String> {
+        let count = self
+            .ivars()
+            .state
+            .borrow()
+            .document
+            .as_ref()
+            .map(|doc| doc.column_count())
+            .unwrap_or(0);
+        (0..count)
+            .map(|column| self.ivars().state.borrow().column_title(column))
+            .collect()
     }
 
     fn rebuild_columns(&self) {
@@ -1008,6 +1414,106 @@ fn button(
     };
     button.setFrame(NSRect::new(NSPoint::new(x, y), NSSize::new(width, 24.0)));
     button
+}
+
+fn section_label(title: &str, mtm: MainThreadMarker, x: f64, y: f64) -> Retained<NSTextField> {
+    let label = NSTextField::labelWithString(&NSString::from_str(title), mtm);
+    label.setFrame(NSRect::new(NSPoint::new(x, y), NSSize::new(220.0, 20.0)));
+    label.setFont(Some(&NSFont::boldSystemFontOfSize(13.0)));
+    label.setTextColor(Some(&NSColor::labelColor()));
+    label
+}
+
+fn muted_label(
+    title: &str,
+    mtm: MainThreadMarker,
+    x: f64,
+    y: f64,
+    width: f64,
+) -> Retained<NSTextField> {
+    let label = NSTextField::labelWithString(&NSString::from_str(title), mtm);
+    label.setFrame(NSRect::new(NSPoint::new(x, y), NSSize::new(width, 20.0)));
+    label.setFont(Some(&NSFont::systemFontOfSize(12.0)));
+    label.setTextColor(Some(&NSColor::secondaryLabelColor()));
+    label
+}
+
+fn popup(
+    titles: &[String],
+    selected: usize,
+    mtm: MainThreadMarker,
+    x: f64,
+    y: f64,
+    width: f64,
+) -> Retained<NSPopUpButton> {
+    let popup = NSPopUpButton::initWithFrame_pullsDown(
+        NSPopUpButton::alloc(mtm),
+        NSRect::new(NSPoint::new(x, y), NSSize::new(width, 24.0)),
+        false,
+    );
+    if titles.is_empty() {
+        popup.addItemWithTitle(&NSString::from_str("No columns"));
+    } else {
+        for title in titles {
+            popup.addItemWithTitle(&NSString::from_str(title));
+        }
+        popup.selectItemAtIndex(selected.min(titles.len() - 1) as NSInteger);
+    }
+    popup
+}
+
+fn filter_operator_titles() -> Vec<String> {
+    [
+        "Contains",
+        "Does not contain",
+        "Equals",
+        "Does not equal",
+        "Starts with",
+        "Ends with",
+        "Greater than",
+        "Greater than or equal",
+        "Less than",
+        "Less than or equal",
+        "Is empty",
+        "Is not empty",
+    ]
+    .iter()
+    .map(|title| title.to_string())
+    .collect()
+}
+
+fn filter_operator_index(operator: FilterOperator) -> usize {
+    match operator {
+        FilterOperator::Contains => 0,
+        FilterOperator::DoesNotContain => 1,
+        FilterOperator::Equals => 2,
+        FilterOperator::DoesNotEqual => 3,
+        FilterOperator::StartsWith => 4,
+        FilterOperator::EndsWith => 5,
+        FilterOperator::GreaterThan => 6,
+        FilterOperator::GreaterThanOrEqual => 7,
+        FilterOperator::LessThan => 8,
+        FilterOperator::LessThanOrEqual => 9,
+        FilterOperator::IsEmpty => 10,
+        FilterOperator::IsNotEmpty => 11,
+    }
+}
+
+fn filter_operator_at(index: NSInteger) -> FilterOperator {
+    match index {
+        1 => FilterOperator::DoesNotContain,
+        2 => FilterOperator::Equals,
+        3 => FilterOperator::DoesNotEqual,
+        4 => FilterOperator::StartsWith,
+        5 => FilterOperator::EndsWith,
+        6 => FilterOperator::GreaterThan,
+        7 => FilterOperator::GreaterThanOrEqual,
+        8 => FilterOperator::LessThan,
+        9 => FilterOperator::LessThanOrEqual,
+        10 => FilterOperator::IsEmpty,
+        11 => FilterOperator::IsNotEmpty,
+        _ => FilterOperator::Contains,
+    }
 }
 
 unsafe fn any_ref<T: ?Sized + Message>(value: &T) -> &AnyObject {

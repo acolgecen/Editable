@@ -46,6 +46,7 @@ fn bundle() -> io::Result<()> {
 
     fs::write(contents.join("Info.plist"), info_plist())?;
     fs::write(contents.join("PkgInfo"), "APPL????")?;
+    sign_app(&app)?;
     println!("{}", app.display());
     Ok(())
 }
@@ -114,6 +115,19 @@ fn run(program: &str, args: &[&str]) -> io::Result<()> {
     } else {
         Ok(())
     }
+}
+
+fn sign_app(app: &Path) -> io::Result<()> {
+    run(
+        "codesign",
+        &[
+            "--force",
+            "--deep",
+            "--sign",
+            "-",
+            app.to_str().expect("app bundle path is valid UTF-8"),
+        ],
+    )
 }
 
 fn write_icns_fallback(iconset: &Path, output: &Path) -> io::Result<()> {
