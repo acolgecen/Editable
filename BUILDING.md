@@ -11,7 +11,7 @@ This repository intentionally does not include a README yet.
 
 - macOS with Apple Command Line Tools or Xcode.
 - Rust stable, installed through `rustup`.
-- The standard macOS tools `sips` and `iconutil` for icon generation.
+- The standard macOS tools `sips`, `iconutil`, and `codesign`.
 
 Check the Apple tools:
 
@@ -20,6 +20,7 @@ xcode-select --install
 clang --version
 which sips
 which iconutil
+which codesign
 ```
 
 Install Rust if `cargo --version` fails:
@@ -100,6 +101,20 @@ You can do the full local build in one command:
 ./scripts/build-app.sh
 ```
 
+The build script signs the completed app bundle with an ad-hoc identity by
+default:
+
+```bash
+codesign --force --deep --sign - dist/Editable.app
+```
+
+This does not require an Apple Developer account. If you later have a signing
+certificate, pass it with `SIGN_IDENTITY`:
+
+```bash
+SIGN_IDENTITY="Developer ID Application: Your Name" ./scripts/build-app.sh
+```
+
 ## Launch Locally
 
 Launch the bundled app:
@@ -131,14 +146,6 @@ After launching a CSV, verify the CSV-only editor workflow:
   filtering.
 - Use `Save`, then reopen the file to confirm edits, ordering, skipped leading
   rows, and CSV quoting round-trip correctly.
-
-## Optional Local Codesign
-
-For local testing outside the terminal:
-
-```bash
-codesign --force --deep --sign - dist/Editable.app
-```
 
 ## Manual Verification
 
