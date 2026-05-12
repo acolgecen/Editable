@@ -20,7 +20,8 @@ use objc2_app_kit::{
     NSWindowStyleMask,
 };
 use objc2_foundation::{
-    MainThreadMarker, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
+    MainThreadMarker, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize,
+    NSString, NSUserDefaults,
 };
 use selection::Cell;
 use std::cell::{OnceCell, RefCell};
@@ -32,6 +33,7 @@ const TOOLBAR_HEIGHT: f64 = 44.0;
 const STATUS_HEIGHT: f64 = 24.0;
 const MAX_VISIBLE_COLUMNS: usize = 1_024;
 const ROW_NUMBER_COLUMN: &str = "__row_number__";
+const APPLE_ACCENT_COLOR_KEY: &str = "AppleAccentColor";
 
 #[derive(Default)]
 struct TableIvars {
@@ -380,18 +382,15 @@ define_class!(
                 None => false,
             };
 
-            if selected {
-                text_cell.setDrawsBackground(true);
-                text_cell.setBackgroundColor(Some(&NSColor::selectedTextBackgroundColor()));
-                text_cell.setTextColor(Some(&NSColor::alternateSelectedControlTextColor()));
-            } else if matches!(visible_column, Some(VisibleColumn::RowNumber)) {
-                text_cell.setDrawsBackground(true);
-                text_cell.setBackgroundColor(Some(&NSColor::controlBackgroundColor()));
-                text_cell.setTextColor(Some(&NSColor::secondaryLabelColor()));
-            } else {
-                text_cell.setDrawsBackground(false);
-                text_cell.setTextColor(Some(&NSColor::textColor()));
-            }
+            let active = match visible_column {
+                Some(VisibleColumn::Data(column)) => {
+                    self.ivars().state.borrow().selection.active_cell()
+                        == Cell { row, column }
+                }
+                _ => false,
+            };
+
+            apply_table_cell_style(text_cell, visible_column, selected, active);
         }
     }
 
@@ -762,6 +761,8 @@ impl Delegate {
             NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1120.0, 672.0)),
         );
         table.set_owner(self);
+        table.setBackgroundColor(&NSColor::textBackgroundColor());
+        table.setGridColor(&NSColor::separatorColor());
         table.setUsesAlternatingRowBackgroundColors(true);
         table.setAllowsEmptySelection(true);
         table.setAllowsMultipleSelection(false);
@@ -794,6 +795,7 @@ impl Delegate {
                 | NSAutoresizingMaskOptions::ViewHeightSizable,
         );
         scroll.setBorderType(NSBorderType::NoBorder);
+        scroll.setBackgroundColor(&NSColor::textBackgroundColor());
         scroll.setHasVerticalScroller(true);
         scroll.setHasHorizontalScroller(true);
         scroll.setAutohidesScrollers(false);
@@ -1329,6 +1331,46 @@ enum VisibleColumn {
 enum TableHit {
     RowNumber(usize),
     Data { cell: Cell, table_column: NSInteger },
+}
+
+fn apply_table_cell_style(
+    cell: &NSTextFieldCell,
+    visible_column: Option<VisibleColumn>,
+    selected: bool,
+    active: bool,
+) {
+    cell.setFont(Some(&table_data_font()));
+
+    if selected {
+        cell.setDrawsBackground(true);
+        cell.setBackgroundColor(Some(&selection_background(active)));
+        cell.setTextColor(Some(&NSColor::labelColor()));
+    } else if matches!(visible_column, Some(VisibleColumn::RowNumber)) {
+        cell.setDrawsBackground(true);
+        cell.setBackgroundColor(Some(&NSColor::quaternarySystemFillColor()));
+        cell.setTextColor(Some(&NSColor::secondaryLabelColor()));
+    } else {
+        cell.setDrawsBackground(false);
+        cell.setTextColor(Some(&NSColor::labelColor()));
+    }
+}
+
+fn table_data_font() -> Retained<NSFont> {
+    NSFont::userFixedPitchFontOfSize(13.0).unwrap_or_else(|| NSFont::systemFontOfSize(13.0))
+}
+
+fn selection_background(active: bool) -> Retained<NSColor> {
+    user_accent_color().colorWithAlphaComponent(if active { 0.34 } else { 0.22 })
+}
+
+fn user_accent_color() -> Retained<NSColor> {
+    let defaults = NSUserDefaults::standardUserDefaults();
+    let accent_key = NSString::from_str(APPLE_ACCENT_COLOR_KEY);
+    match defaults.objectForKey(&accent_key) {
+        None => NSColor::systemBlueColor(),
+        Some(_) if defaults.integerForKey(&accent_key) == -1 => NSColor::systemBlueColor(),
+        Some(_) => NSColor::controlAccentColor(),
+    }
 }
 
 fn table_hit(table: &EditableTableView, event: &NSEvent) -> Option<TableHit> {
