@@ -10,14 +10,15 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, Bool, ProtocolObject};
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadOnly, Message};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSAutoresizingMaskOptions,
-    NSBackingStoreType, NSBorderType, NSButton, NSButtonType, NSColor, NSControlStateValueOff,
-    NSControlStateValueOn, NSControlTextEditingDelegate, NSEvent, NSEventModifierFlags, NSFont,
-    NSModalResponseCancel, NSModalResponseOK, NSOpenPanel, NSPopUpButton, NSScrollView,
-    NSTableColumn, NSTableView, NSTableViewColumnAutoresizingStyle, NSTableViewDataSource,
-    NSTableViewDelegate, NSTableViewGridLineStyle, NSTableViewSelectionHighlightStyle,
-    NSTextAlignment, NSTextField, NSTextFieldCell, NSView, NSWindow, NSWindowDelegate,
-    NSWindowStyleMask,
+    NSAlert, NSAlertFirstButtonReturn, NSAlertSecondButtonReturn, NSAlertStyle,
+    NSAlertThirdButtonReturn, NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate,
+    NSAutoresizingMaskOptions, NSBackingStoreType, NSBorderType, NSButton, NSButtonType, NSColor,
+    NSControlStateValueOff, NSControlStateValueOn, NSControlTextEditingDelegate, NSEvent,
+    NSEventModifierFlags, NSFont, NSModalResponseCancel, NSModalResponseOK, NSOpenPanel,
+    NSPopUpButton, NSScrollView, NSTableColumn, NSTableView, NSTableViewColumnAutoresizingStyle,
+    NSTableViewDataSource, NSTableViewDelegate, NSTableViewGridLineStyle,
+    NSTableViewSelectionHighlightStyle, NSTextAlignment, NSTextField, NSTextFieldCell, NSView,
+    NSWindow, NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{
     MainThreadMarker, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize,
@@ -395,6 +396,33 @@ define_class!(
     }
 
     unsafe impl NSWindowDelegate for Delegate {
+        #[unsafe(method(windowShouldClose:))]
+        fn window_should_close(&self, _sender: &NSWindow) -> Bool {
+            if !self
+                .ivars()
+                .state
+                .borrow()
+                .document
+                .as_ref()
+                .is_some_and(editable_csv_core::CsvDocument::is_dirty)
+            {
+                return true.into();
+            }
+
+            let should_close = match self.confirm_close_with_unsaved_changes() {
+                CloseChoice::Save => {
+                    let result = self.ivars().state.borrow_mut().save(None);
+                    let should_close = result.is_ok();
+                    self.handle_result(result);
+                    self.update_status();
+                    should_close
+                }
+                CloseChoice::Discard => true,
+                CloseChoice::Cancel => false,
+            };
+            should_close.into()
+        }
+
         #[unsafe(method(windowWillClose:))]
         fn window_will_close(&self, _notification: &NSNotification) {
             NSApplication::sharedApplication(self.mtm()).terminate(None);
@@ -1161,7 +1189,14 @@ impl Delegate {
             ));
         }
         if let Some(window) = self.ivars().window.get() {
-            window.setTitle(&NSString::from_str(&self.ivars().state.borrow().title()));
+            let state = self.ivars().state.borrow();
+            window.setTitle(&NSString::from_str(&state.title()));
+            window.setDocumentEdited(
+                state
+                    .document
+                    .as_ref()
+                    .is_some_and(editable_csv_core::CsvDocument::is_dirty),
+            );
         }
     }
 
@@ -1319,6 +1354,28 @@ impl Delegate {
             self.ivars().state.borrow_mut().last_error = None;
         }
     }
+
+    fn confirm_close_with_unsaved_changes(&self) -> CloseChoice {
+        let filename = self.ivars().state.borrow().title();
+        let alert = NSAlert::new(self.mtm());
+        alert.setAlertStyle(NSAlertStyle::Warning);
+        alert.setMessageText(&NSString::from_str(&format!(
+            "Do you want to save the changes made to \"{filename}\"?"
+        )));
+        alert.setInformativeText(&NSString::from_str(
+            "Your changes will be lost if you don't save them.",
+        ));
+        alert.addButtonWithTitle(&NSString::from_str("Save"));
+        alert.addButtonWithTitle(&NSString::from_str("Don't Save"));
+        alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+
+        match alert.runModal() {
+            response if response == NSAlertFirstButtonReturn => CloseChoice::Save,
+            response if response == NSAlertSecondButtonReturn => CloseChoice::Discard,
+            response if response == NSAlertThirdButtonReturn => CloseChoice::Cancel,
+            _ => CloseChoice::Cancel,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1331,6 +1388,13 @@ enum VisibleColumn {
 enum TableHit {
     RowNumber(usize),
     Data { cell: Cell, table_column: NSInteger },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseChoice {
+    Save,
+    Discard,
+    Cancel,
 }
 
 fn apply_table_cell_style(

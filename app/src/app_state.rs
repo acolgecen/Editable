@@ -76,7 +76,7 @@ impl EditableState {
             .and_then(|doc| doc.path())
             .and_then(|path| path.file_name())
             .and_then(|name| name.to_str())
-            .map(|name| format!("{name} - Editable"))
+            .map(str::to_string)
             .unwrap_or_else(|| "Editable".to_string())
     }
 
@@ -357,7 +357,7 @@ impl EditableState {
     }
 
     pub fn save(&mut self, target: Option<PathBuf>) -> Result<()> {
-        let Some(doc) = &self.document else {
+        let Some(doc) = &mut self.document else {
             return Ok(());
         };
         let path = target

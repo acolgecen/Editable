@@ -423,8 +423,11 @@ impl CsvDocument {
             .collect()
     }
 
-    pub fn save_to(&self, path: impl AsRef<Path>) -> Result<()> {
+    pub fn save_to(&mut self, path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
         std::fs::write(path, self.to_csv_bytes())?;
+        self.path = Some(path.to_path_buf());
+        self.dirty = false;
         Ok(())
     }
 
@@ -683,6 +686,29 @@ mod tests {
         doc.set_cell(0, 1, "hello, \"world\"").unwrap();
         let text = String::from_utf8(doc.to_csv_bytes()).unwrap();
         assert_eq!(text, "name,note\nAda,\"hello, \"\"world\"\"\"");
+    }
+
+    #[test]
+    fn save_clears_dirty_state() {
+        let mut doc =
+            CsvDocument::from_bytes(b"name,note\nAda,ok\n".to_vec(), OpenOptions::default())
+                .unwrap();
+        doc.set_cell(0, 1, "saved").unwrap();
+        assert!(doc.is_dirty());
+
+        let path = std::env::temp_dir().join(format!(
+            "editable-save-clears-dirty-{}.csv",
+            std::process::id()
+        ));
+        doc.save_to(&path).unwrap();
+
+        assert!(!doc.is_dirty());
+        assert_eq!(doc.path(), Some(path.as_path()));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "name,note\nAda,saved"
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
