@@ -7,24 +7,24 @@ use app_state::EditableState;
 use editable_csv_core::{FilterOperator, FilterRule, NumberFormat, SortDirection, SortKey};
 use objc2::ffi::{NSInteger, NSUInteger};
 use objc2::rc::Retained;
-use objc2::runtime::{AnyObject, Bool, ProtocolObject};
+use objc2::runtime::{AnyObject, Bool, ProtocolObject, Sel};
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadOnly, Message};
 use objc2_app_kit::{
     NSAlert, NSAlertFirstButtonReturn, NSAlertSecondButtonReturn, NSAlertStyle,
     NSAlertThirdButtonReturn, NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate,
     NSApplicationLaunchIsDefaultLaunchKey, NSAutoresizingMaskOptions, NSBackingStoreType,
-    NSBezelStyle, NSBorderType, NSButton, NSButtonType, NSCellImagePosition, NSColor,
+    NSBezelStyle, NSBorderType, NSButton, NSButtonType, NSCellImagePosition, NSColor, NSControl,
     NSControlStateValueOff, NSControlStateValueOn, NSControlTextEditingDelegate, NSEvent,
     NSEventModifierFlags, NSFont, NSImage, NSImageNameApplicationIcon, NSImageScaling, NSMenu,
     NSMenuItem, NSModalResponseCancel, NSModalResponseOK, NSOpenPanel, NSPopUpButton, NSSavePanel,
     NSScrollView, NSTableColumn, NSTableView, NSTableViewColumnAutoresizingStyle,
     NSTableViewDataSource, NSTableViewDelegate, NSTableViewGridLineStyle,
-    NSTableViewSelectionHighlightStyle, NSTextAlignment, NSTextField, NSTextFieldCell, NSView,
-    NSWindow, NSWindowDelegate, NSWindowStyleMask,
+    NSTableViewSelectionHighlightStyle, NSTextAlignment, NSTextField, NSTextFieldCell, NSTextView,
+    NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{
-    MainThreadMarker, NSLocale, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect,
-    NSSize, NSString, NSUserDefaults,
+    MainThreadMarker, NSLocale, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRange,
+    NSRect, NSSize, NSString, NSUserDefaults,
 };
 use selection::Cell;
 use std::cell::{OnceCell, RefCell};
@@ -38,6 +38,12 @@ const STATUS_HEIGHT: f64 = 24.0;
 const MAX_VISIBLE_COLUMNS: usize = 1_024;
 const ROW_NUMBER_COLUMN: &str = "__row_number__";
 const APPLE_ACCENT_COLOR_KEY: &str = "AppleAccentColor";
+const KEY_RETURN: u16 = 36;
+const KEY_KEYPAD_ENTER: u16 = 76;
+const KEY_LEFT_ARROW: u16 = 123;
+const KEY_RIGHT_ARROW: u16 = 124;
+const KEY_DOWN_ARROW: u16 = 125;
+const KEY_UP_ARROW: u16 = 126;
 
 #[derive(Clone, Copy)]
 enum ToolbarIcon {
@@ -221,9 +227,28 @@ define_class!(
     // SAFETY: NSObjectProtocol has no additional safety requirements.
     unsafe impl NSObjectProtocol for Delegate {}
 
-    // SAFETY: Editable does not customize control-text editing callbacks; the
-    // conformance is required because NSTableViewDelegate refines this protocol.
-    unsafe impl NSControlTextEditingDelegate for Delegate {}
+    // SAFETY: The text-editing delegate is used to turn field-editor arrow
+    // commands back into table navigation while a cell is being edited.
+    unsafe impl NSControlTextEditingDelegate for Delegate {
+        #[unsafe(method(control:textView:doCommandBySelector:))]
+        #[allow(non_snake_case)]
+        unsafe fn control_textView_doCommandBySelector(
+            &self,
+            _control: &NSControl,
+            text_view: &NSTextView,
+            command_selector: Sel,
+        ) -> Bool {
+            let Some((rows, columns, selector_extending)) =
+                navigation_delta_for_selector(command_selector)
+            else {
+                return false.into();
+            };
+            let extending = selector_extending || current_event_has_shift(self.mtm());
+            self.commit_text_view_edit(text_view);
+            self.navigate_selection(rows, columns, extending);
+            true.into()
+        }
+    }
 
     // SAFETY: NSApplicationDelegate method signatures match AppKit.
     unsafe impl NSApplicationDelegate for Delegate {
@@ -966,22 +991,7 @@ define_class!(
 
         #[unsafe(method(editSelectedCell:))]
         fn edit_selected_cell(&self, _sender: &AnyObject) {
-            let Some(table) = self.ivars().table.get() else {
-                return;
-            };
-            let active = self.ivars().state.borrow().selection.active_cell();
-            let table_column = active.column + 1;
-            if table.numberOfRows() <= active.row as NSInteger
-                || table.numberOfColumns() <= table_column as NSInteger
-            {
-                return;
-            }
-            table.editColumn_row_withEvent_select(
-                table_column as NSInteger,
-                active.row as NSInteger,
-                None,
-                true,
-            );
+            self.edit_top_left_selected_cell(None);
         }
     }
 );
@@ -2134,6 +2144,54 @@ impl Delegate {
         }
     }
 
+    fn navigate_selection(&self, rows: isize, columns: isize, extending: bool) {
+        self.ivars()
+            .state
+            .borrow_mut()
+            .move_selection(rows, columns, extending);
+        self.refresh_table();
+    }
+
+    fn edit_top_left_selected_cell(&self, initial_text: Option<&str>) -> bool {
+        let Some(table) = self.ivars().table.get() else {
+            return false;
+        };
+        let active = self.ivars().state.borrow().selection.top_left_cell();
+        let table_column = active.column + 1;
+        if table.numberOfRows() <= active.row as NSInteger
+            || table.numberOfColumns() <= table_column as NSInteger
+        {
+            return false;
+        }
+
+        self.ivars()
+            .state
+            .borrow_mut()
+            .select_cell(active.row, active.column);
+        table.reloadData();
+        table.editColumn_row_withEvent_select(
+            table_column as NSInteger,
+            active.row as NSInteger,
+            None,
+            true,
+        );
+
+        if let Some(initial_text) = initial_text {
+            if let Some(editor) = table.currentEditor() {
+                let value = NSString::from_str(initial_text);
+                editor.setString(&value);
+                editor.setSelectedRange(NSRange::new(value.length(), 0));
+            }
+        }
+        true
+    }
+
+    fn commit_text_view_edit(&self, _text_view: &NSTextView) {
+        if let Some(window) = self.ivars().window.get() {
+            unsafe { window.endEditingFor(None) };
+        }
+    }
+
     fn table_mouse_down(&self, table: &EditableTableView, event: &NSEvent) {
         let Some(hit) = table_hit(table, event) else {
             return;
@@ -2268,27 +2326,55 @@ impl Delegate {
 
     fn table_key_down(&self, event: &NSEvent) -> bool {
         let modifiers = event.modifierFlags();
-        if !modifiers.contains(NSEventModifierFlags::Command) {
-            return false;
-        }
         let characters = event
             .charactersIgnoringModifiers()
             .map(|value| value.to_string())
             .unwrap_or_default();
-        if !characters.eq_ignore_ascii_case("z") {
-            return false;
-        }
 
-        if modifiers.contains(NSEventModifierFlags::Shift) {
-            if self.ivars().state.borrow_mut().redo() {
+        if modifiers.contains(NSEventModifierFlags::Command) && characters.eq_ignore_ascii_case("z")
+        {
+            if modifiers.contains(NSEventModifierFlags::Shift) {
+                if self.ivars().state.borrow_mut().redo() {
+                    self.rebuild_columns();
+                    self.refresh_table();
+                }
+            } else if self.ivars().state.borrow_mut().undo() {
                 self.rebuild_columns();
                 self.refresh_table();
             }
-        } else if self.ivars().state.borrow_mut().undo() {
-            self.rebuild_columns();
-            self.refresh_table();
+            return true;
         }
-        true
+
+        if let Some((rows, columns)) = navigation_delta_for_key_code(event.keyCode()) {
+            self.navigate_selection(
+                rows,
+                columns,
+                modifiers.contains(NSEventModifierFlags::Shift),
+            );
+            return true;
+        }
+
+        if matches!(event.keyCode(), KEY_RETURN | KEY_KEYPAD_ENTER) {
+            return self.edit_top_left_selected_cell(None);
+        }
+
+        if modifiers.intersects(
+            NSEventModifierFlags::Command
+                | NSEventModifierFlags::Control
+                | NSEventModifierFlags::Option,
+        ) {
+            return false;
+        }
+
+        let characters = event
+            .characters()
+            .map(|value| value.to_string())
+            .unwrap_or_default();
+        if is_cell_edit_start_text(&characters) {
+            return self.edit_top_left_selected_cell(Some(&characters));
+        }
+
+        false
     }
 
     fn handle_result(&self, result: editable_csv_core::Result<()>) {
@@ -2353,6 +2439,41 @@ struct FormattingDraft {
     skip_rows: usize,
     delimiter: u8,
     number_format: NumberFormat,
+}
+
+fn navigation_delta_for_key_code(key_code: u16) -> Option<(isize, isize)> {
+    match key_code {
+        KEY_UP_ARROW => Some((-1, 0)),
+        KEY_DOWN_ARROW => Some((1, 0)),
+        KEY_LEFT_ARROW => Some((0, -1)),
+        KEY_RIGHT_ARROW => Some((0, 1)),
+        _ => None,
+    }
+}
+
+fn navigation_delta_for_selector(selector: Sel) -> Option<(isize, isize, bool)> {
+    match selector {
+        selector if selector == sel!(moveUp:) => Some((-1, 0, false)),
+        selector if selector == sel!(moveDown:) => Some((1, 0, false)),
+        selector if selector == sel!(moveLeft:) => Some((0, -1, false)),
+        selector if selector == sel!(moveRight:) => Some((0, 1, false)),
+        selector if selector == sel!(moveUpAndModifySelection:) => Some((-1, 0, true)),
+        selector if selector == sel!(moveDownAndModifySelection:) => Some((1, 0, true)),
+        selector if selector == sel!(moveLeftAndModifySelection:) => Some((0, -1, true)),
+        selector if selector == sel!(moveRightAndModifySelection:) => Some((0, 1, true)),
+        _ => None,
+    }
+}
+
+fn current_event_has_shift(mtm: MainThreadMarker) -> bool {
+    NSApplication::sharedApplication(mtm)
+        .currentEvent()
+        .is_some_and(|event| event.modifierFlags().contains(NSEventModifierFlags::Shift))
+}
+
+fn is_cell_edit_start_text(text: &str) -> bool {
+    let mut chars = text.chars();
+    matches!(chars.next(), Some(ch) if ch.is_alphanumeric()) && chars.next().is_none()
 }
 
 fn apply_table_cell_style(

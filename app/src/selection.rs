@@ -106,6 +106,27 @@ impl Selection {
         }
     }
 
+    pub fn top_left_cell(&self) -> Cell {
+        match self {
+            Selection::Cells { active, cells, .. } => {
+                cells.iter().next().copied().unwrap_or(*active)
+            }
+            Selection::Cell(rect) => {
+                let (row, column, _, _) = rect.bounds();
+                Cell { row, column }
+            }
+            Selection::Row { anchor, focus } => Cell {
+                row: (*anchor).min(*focus),
+                column: 0,
+            },
+            Selection::Column { anchor, focus } => Cell {
+                row: 0,
+                column: (*anchor).min(*focus),
+            },
+            Selection::All => Cell { row: 0, column: 0 },
+        }
+    }
+
     pub fn contains_cell(&self, row: usize, column: usize) -> bool {
         match self {
             Selection::Cells { cells, .. } => cells.contains(&Cell { row, column }),
@@ -134,7 +155,7 @@ impl Selection {
     }
 
     pub fn move_by(&mut self, rows: isize, columns: isize, row_limit: usize, column_limit: usize) {
-        let active = self.active_cell();
+        let active = self.top_left_cell();
         let row = active
             .row
             .saturating_add_signed(rows)
@@ -153,6 +174,10 @@ impl Selection {
         row_limit: usize,
         column_limit: usize,
     ) {
+        let top_left = self.top_left_cell();
+        if self.anchor_cell() != top_left && self.cells().len() > 1 {
+            *self = Selection::single_cell(top_left);
+        }
         let active = self.active_cell();
         let row = active
             .row
@@ -282,5 +307,22 @@ mod tests {
         assert!(!selection.contains_cell(1, 1));
         assert!(selection.toggle_cell(Cell { row: 2, column: 3 }));
         assert!(selection.contains_cell(2, 3));
+    }
+
+    #[test]
+    fn movement_starts_from_top_left_selected_cell() {
+        let mut selection = Selection::single_cell(Cell { row: 4, column: 4 });
+        selection.select_rect_to(Cell { row: 2, column: 2 });
+        selection.move_by(1, 1, 10, 10);
+        assert_eq!(selection.active_cell(), Cell { row: 3, column: 3 });
+    }
+
+    #[test]
+    fn shift_movement_extends_from_single_cell() {
+        let mut selection = Selection::single_cell(Cell { row: 2, column: 2 });
+        selection.extend_by(0, 1, 10, 10);
+        assert!(selection.contains_cell(2, 2));
+        assert!(selection.contains_cell(2, 3));
+        assert_eq!(selection.active_cell(), Cell { row: 2, column: 3 });
     }
 }
