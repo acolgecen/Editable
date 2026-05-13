@@ -12,13 +12,14 @@ use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadOnly, Message};
 use objc2_app_kit::{
     NSAlert, NSAlertFirstButtonReturn, NSAlertSecondButtonReturn, NSAlertStyle,
     NSAlertThirdButtonReturn, NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate,
-    NSAutoresizingMaskOptions, NSBackingStoreType, NSBorderType, NSButton, NSButtonType, NSColor,
-    NSControlStateValueOff, NSControlStateValueOn, NSControlTextEditingDelegate, NSEvent,
-    NSEventModifierFlags, NSFont, NSMenu, NSMenuItem, NSModalResponseCancel, NSModalResponseOK,
-    NSOpenPanel, NSPopUpButton, NSSavePanel, NSScrollView, NSTableColumn, NSTableView,
-    NSTableViewColumnAutoresizingStyle, NSTableViewDataSource, NSTableViewDelegate,
-    NSTableViewGridLineStyle, NSTableViewSelectionHighlightStyle, NSTextAlignment, NSTextField,
-    NSTextFieldCell, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
+    NSAutoresizingMaskOptions, NSBackingStoreType, NSBezelStyle, NSBorderType, NSButton,
+    NSButtonType, NSCellImagePosition, NSColor, NSControlStateValueOff, NSControlStateValueOn,
+    NSControlTextEditingDelegate, NSEvent, NSEventModifierFlags, NSFont, NSImage, NSImageScaling,
+    NSMenu, NSMenuItem, NSModalResponseCancel, NSModalResponseOK, NSOpenPanel, NSPopUpButton,
+    NSSavePanel, NSScrollView, NSTableColumn, NSTableView, NSTableViewColumnAutoresizingStyle,
+    NSTableViewDataSource, NSTableViewDelegate, NSTableViewGridLineStyle,
+    NSTableViewSelectionHighlightStyle, NSTextAlignment, NSTextField, NSTextFieldCell, NSView,
+    NSWindow, NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{
     MainThreadMarker, NSLocale, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect,
@@ -31,10 +32,66 @@ use std::path::PathBuf;
 use std::ptr;
 
 const TOOLBAR_HEIGHT: f64 = 44.0;
+const TOOLBAR_BUTTON_HEIGHT: f64 = 28.0;
 const STATUS_HEIGHT: f64 = 24.0;
 const MAX_VISIBLE_COLUMNS: usize = 1_024;
 const ROW_NUMBER_COLUMN: &str = "__row_number__";
 const APPLE_ACCENT_COLOR_KEY: &str = "AppleAccentColor";
+
+#[derive(Clone, Copy)]
+enum ToolbarIcon {
+    Formatting,
+    SortFilter,
+    Undo,
+    Redo,
+    AddRow,
+    AddColumn,
+    DeleteSelection,
+    MoveRowUp,
+    MoveRowDown,
+    MoveColumnLeft,
+    MoveColumnRight,
+    Save,
+}
+
+impl ToolbarIcon {
+    fn symbols(self) -> &'static [&'static str] {
+        match self {
+            Self::Formatting => &["tablecells", "table"],
+            Self::SortFilter => &[
+                "line.3.horizontal.decrease.circle",
+                "line.3.horizontal.decrease",
+            ],
+            Self::Undo => &["arrow.uturn.backward", "gobackward"],
+            Self::Redo => &["arrow.uturn.forward", "goforward"],
+            Self::AddRow => &["plus.rectangle.on.rectangle", "plus.rectangle", "plus"],
+            Self::AddColumn => &["plus.square.on.square", "plus.square", "plus"],
+            Self::DeleteSelection => &["xmark.square", "trash", "minus.square"],
+            Self::MoveRowUp => &["arrow.up.to.line.compact", "arrow.up"],
+            Self::MoveRowDown => &["arrow.down.to.line.compact", "arrow.down"],
+            Self::MoveColumnLeft => &["arrow.left.to.line.compact", "arrow.left"],
+            Self::MoveColumnRight => &["arrow.right.to.line.compact", "arrow.right"],
+            Self::Save => &["square.and.arrow.down", "tray.and.arrow.down"],
+        }
+    }
+
+    fn accessibility_label(self) -> &'static str {
+        match self {
+            Self::Formatting => "table formatting",
+            Self::SortFilter => "sort and filter",
+            Self::Undo => "undo",
+            Self::Redo => "redo",
+            Self::AddRow => "add row",
+            Self::AddColumn => "add column",
+            Self::DeleteSelection => "delete selection",
+            Self::MoveRowUp => "move row up",
+            Self::MoveRowDown => "move row down",
+            Self::MoveColumnLeft => "move column left",
+            Self::MoveColumnRight => "move column right",
+            Self::Save => "save",
+        }
+    }
+}
 
 #[derive(Default)]
 struct TableIvars {
@@ -1291,40 +1348,66 @@ impl Delegate {
         );
 
         let target = unsafe { any_ref(self) };
-        toolbar.addSubview(&button(
-            "Formatting",
-            target,
-            sel!(openFormatting:),
-            mtm,
-            16.0,
-            10.0,
-            96.0,
-        ));
-
-        toolbar.addSubview(&button(
-            "Sort/Filter",
-            target,
-            sel!(openSortFilter:),
-            mtm,
-            124.0,
-            10.0,
-            92.0,
-        ));
-
         let controls = [
-            ("Undo", sel!(undoChange:), 230.0, 56.0),
-            ("Redo", sel!(redoChange:), 290.0, 56.0),
-            ("+ Row", sel!(addRow:), 362.0, 56.0),
-            ("+ Col", sel!(addColumn:), 422.0, 54.0),
-            ("Delete", sel!(deleteSelection:), 480.0, 60.0),
-            ("Row Up", sel!(rowUp:), 548.0, 62.0),
-            ("Row Down", sel!(rowDown:), 614.0, 76.0),
-            ("Col Left", sel!(columnLeft:), 696.0, 70.0),
-            ("Col Right", sel!(columnRight:), 774.0, 76.0),
-            ("Save", sel!(saveDocument:), 858.0, 54.0),
+            (
+                ToolbarIcon::Formatting,
+                "Format",
+                sel!(openFormatting:),
+                12.0,
+                112.0,
+            ),
+            (
+                ToolbarIcon::SortFilter,
+                "Sort/Filter",
+                sel!(openSortFilter:),
+                128.0,
+                108.0,
+            ),
+            (ToolbarIcon::Undo, "Undo", sel!(undoChange:), 248.0, 72.0),
+            (ToolbarIcon::Redo, "Redo", sel!(redoChange:), 324.0, 72.0),
+            (ToolbarIcon::AddRow, "Add Row", sel!(addRow:), 408.0, 82.0),
+            (
+                ToolbarIcon::AddColumn,
+                "Add Col",
+                sel!(addColumn:),
+                494.0,
+                82.0,
+            ),
+            (
+                ToolbarIcon::DeleteSelection,
+                "Delete",
+                sel!(deleteSelection:),
+                580.0,
+                82.0,
+            ),
+            (ToolbarIcon::MoveRowUp, "Row Up", sel!(rowUp:), 674.0, 80.0),
+            (
+                ToolbarIcon::MoveRowDown,
+                "Row Down",
+                sel!(rowDown:),
+                758.0,
+                94.0,
+            ),
+            (
+                ToolbarIcon::MoveColumnLeft,
+                "Col Left",
+                sel!(columnLeft:),
+                864.0,
+                84.0,
+            ),
+            (
+                ToolbarIcon::MoveColumnRight,
+                "Col Right",
+                sel!(columnRight:),
+                952.0,
+                96.0,
+            ),
+            (ToolbarIcon::Save, "Save", sel!(saveDocument:), 1058.0, 62.0),
         ];
-        for (title, action, x, width) in controls {
-            toolbar.addSubview(&button(title, target, action, mtm, x, 10.0, width));
+        for (icon, title, action, x, width) in controls {
+            toolbar.addSubview(&toolbar_button(
+                icon, title, target, action, mtm, x, 8.0, width,
+            ));
         }
 
         toolbar
@@ -2377,6 +2460,43 @@ fn button(
         )
     };
     button.setFrame(NSRect::new(NSPoint::new(x, y), NSSize::new(width, 24.0)));
+    button
+}
+
+fn toolbar_button(
+    icon: ToolbarIcon,
+    title: &str,
+    target: &AnyObject,
+    action: objc2::runtime::Sel,
+    mtm: MainThreadMarker,
+    x: f64,
+    y: f64,
+    width: f64,
+) -> Retained<NSButton> {
+    let button = button(title, target, action, mtm, x, y, width);
+    button.setFrame(NSRect::new(
+        NSPoint::new(x, y),
+        NSSize::new(width, TOOLBAR_BUTTON_HEIGHT),
+    ));
+    button.setBezelStyle(NSBezelStyle::Toolbar);
+    button.setFont(Some(&NSFont::systemFontOfSize(12.0)));
+    button.setImagePosition(NSCellImagePosition::ImageLeading);
+    button.setImageScaling(NSImageScaling::ScaleProportionallyDown);
+    button.setImageHugsTitle(true);
+    button.setToolTip(Some(&NSString::from_str(icon.accessibility_label())));
+
+    let description = NSString::from_str(icon.accessibility_label());
+    for symbol in icon.symbols() {
+        if let Some(image) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+            &NSString::from_str(symbol),
+            Some(&description),
+        ) {
+            image.setTemplate(true);
+            button.setImage(Some(&image));
+            break;
+        }
+    }
+
     button
 }
 
