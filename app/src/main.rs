@@ -13,14 +13,14 @@ use objc2_app_kit::{
     NSAlert, NSAlertFirstButtonReturn, NSAlertSecondButtonReturn, NSAlertStyle,
     NSAlertThirdButtonReturn, NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate,
     NSApplicationLaunchIsDefaultLaunchKey, NSAutoresizingMaskOptions, NSBackingStoreType,
-    NSBezelStyle, NSBorderType, NSButton, NSButtonType, NSCellImagePosition, NSColor, NSControl,
-    NSControlStateValueOff, NSControlStateValueOn, NSControlTextEditingDelegate, NSEvent,
-    NSEventModifierFlags, NSFont, NSImage, NSImageNameApplicationIcon, NSImageScaling, NSMenu,
-    NSMenuItem, NSModalResponseCancel, NSModalResponseOK, NSOpenPanel, NSPopUpButton, NSSavePanel,
-    NSScrollView, NSTableColumn, NSTableView, NSTableViewColumnAutoresizingStyle,
-    NSTableViewDataSource, NSTableViewDelegate, NSTableViewGridLineStyle,
-    NSTableViewSelectionHighlightStyle, NSTextAlignment, NSTextField, NSTextFieldCell, NSTextView,
-    NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
+    NSBezelStyle, NSBorderType, NSBox, NSBoxType, NSButton, NSButtonType, NSCellImagePosition,
+    NSColor, NSControl, NSControlStateValueOff, NSControlStateValueOn,
+    NSControlTextEditingDelegate, NSEvent, NSEventModifierFlags, NSFont, NSImage,
+    NSImageNameApplicationIcon, NSImageScaling, NSMenu, NSMenuItem, NSModalResponseCancel,
+    NSModalResponseOK, NSOpenPanel, NSPopUpButton, NSSavePanel, NSScrollView, NSTableColumn,
+    NSTableView, NSTableViewColumnAutoresizingStyle, NSTableViewDataSource, NSTableViewDelegate,
+    NSTableViewGridLineStyle, NSTableViewSelectionHighlightStyle, NSTextAlignment, NSTextField,
+    NSTextFieldCell, NSTextView, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{
     MainThreadMarker, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRange, NSRect, NSSize,
@@ -38,7 +38,10 @@ const TOOLBAR_HORIZONTAL_PADDING: f64 = 12.0;
 const TOOLBAR_VERTICAL_PADDING: f64 = 8.0;
 const TOOLBAR_BUTTON_GAP: f64 = 8.0;
 const TOOLBAR_ROW_GAP: f64 = 6.0;
-const STATUS_HEIGHT: f64 = 24.0;
+const STATUS_HEIGHT: f64 = 36.0;
+const STATUS_LABEL_HEIGHT: f64 = 20.0;
+const STATUS_CONTROL_HEIGHT: f64 = 24.0;
+const STATUS_SEPARATOR_HEIGHT: f64 = 1.0;
 const STATUS_SIDE_PADDING: f64 = 12.0;
 const STATUS_LABEL_GAP: f64 = 12.0;
 const MAX_VISIBLE_COLUMNS: usize = 1_024;
@@ -214,6 +217,8 @@ struct AppDelegateIvars {
     table: OnceCell<Retained<EditableTableView>>,
     toolbar: OnceCell<Retained<NSView>>,
     scroll: OnceCell<Retained<NSScrollView>>,
+    status_bar: OnceCell<Retained<NSBox>>,
+    status_separator: OnceCell<Retained<NSBox>>,
     status: OnceCell<Retained<NSTextField>>,
     selection_status: OnceCell<Retained<NSPopUpButton>>,
     selected_selection_metric: RefCell<SelectionMetric>,
@@ -1057,11 +1062,15 @@ impl Delegate {
             .contentView()
             .expect("window must have a content view");
         let toolbar = self.make_toolbar(mtm);
+        let status_bar = self.make_status_bar(mtm);
+        let status_separator = self.make_status_separator(mtm);
         let status = self.make_status(mtm);
         let selection_status = self.make_selection_status(mtm);
         let scroll = self.make_table_area(mtm);
         content.addSubview(&toolbar);
         content.addSubview(&scroll);
+        content.addSubview(&status_bar);
+        content.addSubview(&status_separator);
         content.addSubview(&status);
         content.addSubview(&selection_status);
 
@@ -1490,14 +1499,52 @@ impl Delegate {
         toolbar
     }
 
+    fn make_status_bar(&self, mtm: MainThreadMarker) -> Retained<NSBox> {
+        let bar = NSBox::initWithFrame(
+            NSBox::alloc(mtm),
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1120.0, STATUS_HEIGHT)),
+        );
+        bar.setBoxType(NSBoxType::Custom);
+        bar.setTitle(&NSString::from_str(""));
+        bar.setTransparent(false);
+        bar.setBorderWidth(0.0);
+        bar.setFillColor(&NSColor::windowBackgroundColor());
+        bar.setAutoresizingMask(
+            NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewMaxYMargin,
+        );
+
+        self.ivars().status_bar.set(bar.clone()).ok();
+        bar
+    }
+
+    fn make_status_separator(&self, mtm: MainThreadMarker) -> Retained<NSBox> {
+        let separator = NSBox::initWithFrame(
+            NSBox::alloc(mtm),
+            NSRect::new(
+                NSPoint::new(0.0, STATUS_HEIGHT - STATUS_SEPARATOR_HEIGHT),
+                NSSize::new(1120.0, STATUS_SEPARATOR_HEIGHT),
+            ),
+        );
+        separator.setBoxType(NSBoxType::Custom);
+        separator.setTitle(&NSString::from_str(""));
+        separator.setTransparent(false);
+        separator.setBorderWidth(0.0);
+        separator.setFillColor(&NSColor::separatorColor().colorWithAlphaComponent(0.14));
+        separator.setAutoresizingMask(
+            NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewMaxYMargin,
+        );
+        self.ivars().status_separator.set(separator.clone()).ok();
+        separator
+    }
+
     fn make_status(&self, mtm: MainThreadMarker) -> Retained<NSTextField> {
         let status = NSTextField::labelWithString(&NSString::from_str(""), mtm);
         status.setFrame(NSRect::new(
-            NSPoint::new(12.0, 2.0),
-            NSSize::new(1096.0, STATUS_HEIGHT),
+            NSPoint::new(STATUS_SIDE_PADDING, status_label_y()),
+            NSSize::new(1096.0, STATUS_LABEL_HEIGHT),
         ));
         status.setTextColor(Some(&NSColor::secondaryLabelColor()));
-        status.setFont(Some(&NSFont::systemFontOfSize(11.0)));
+        status.setFont(Some(&NSFont::systemFontOfSize(12.0)));
         status.setAlignment(NSTextAlignment::Left);
         status.setAutoresizingMask(
             NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewMaxYMargin,
@@ -1509,11 +1556,14 @@ impl Delegate {
     fn make_selection_status(&self, mtm: MainThreadMarker) -> Retained<NSPopUpButton> {
         let status = NSPopUpButton::initWithFrame_pullsDown(
             NSPopUpButton::alloc(mtm),
-            NSRect::new(NSPoint::new(12.0, 2.0), NSSize::new(160.0, 22.0)),
+            NSRect::new(
+                NSPoint::new(12.0, status_control_y()),
+                NSSize::new(160.0, STATUS_CONTROL_HEIGHT),
+            ),
             false,
         );
         status.setBezelStyle(NSBezelStyle::Toolbar);
-        status.setFont(Some(&NSFont::systemFontOfSize(11.0)));
+        status.setFont(Some(&NSFont::systemFontOfSize(12.0)));
         status.setHidden(true);
         unsafe {
             status.setTarget(Some(any_ref(self)));
@@ -2178,6 +2228,20 @@ impl Delegate {
             ));
         }
 
+        if let Some(status_bar) = self.ivars().status_bar.get() {
+            status_bar.setFrame(NSRect::new(
+                NSPoint::new(0.0, 0.0),
+                NSSize::new(width, STATUS_HEIGHT),
+            ));
+        }
+
+        if let Some(separator) = self.ivars().status_separator.get() {
+            separator.setFrame(NSRect::new(
+                NSPoint::new(0.0, STATUS_HEIGHT - STATUS_SEPARATOR_HEIGHT),
+                NSSize::new(width, STATUS_SEPARATOR_HEIGHT),
+            ));
+        }
+
         self.layout_status_labels();
     }
 
@@ -2192,13 +2256,10 @@ impl Delegate {
     }
 
     fn layout_status_labels(&self) {
-        let Some(window) = self.ivars().window.get() else {
+        let Some(status_bar) = self.ivars().status_bar.get() else {
             return;
         };
-        let Some(content) = window.contentView() else {
-            return;
-        };
-        let width = content.frame().size.width.max(0.0);
+        let width = status_bar.frame().size.width.max(0.0);
         let available = (width - STATUS_SIDE_PADDING * 2.0).max(0.0);
         let stats_text = self
             .ivars()
@@ -2218,8 +2279,11 @@ impl Delegate {
         if let Some(selection_status) = self.ivars().selection_status.get() {
             selection_status.setHidden(stats_text.is_empty());
             selection_status.setFrame(NSRect::new(
-                NSPoint::new(STATUS_SIDE_PADDING + available - stats_width, 1.0),
-                NSSize::new(stats_width, STATUS_HEIGHT - 2.0),
+                NSPoint::new(
+                    STATUS_SIDE_PADDING + available - stats_width,
+                    status_control_y(),
+                ),
+                NSSize::new(stats_width, STATUS_CONTROL_HEIGHT),
             ));
         }
 
@@ -2231,8 +2295,8 @@ impl Delegate {
             };
             status.setHidden(left_width < 32.0);
             status.setFrame(NSRect::new(
-                NSPoint::new(STATUS_SIDE_PADDING, 2.0),
-                NSSize::new(left_width, STATUS_HEIGHT),
+                NSPoint::new(STATUS_SIDE_PADDING, status_label_y()),
+                NSSize::new(left_width, STATUS_LABEL_HEIGHT),
             ));
         }
     }
@@ -2850,6 +2914,14 @@ fn layout_toolbar_buttons(toolbar: &NSView, width: f64, height: f64) {
 
 fn estimated_status_text_width(text: &str) -> f64 {
     (text.chars().count() as f64 * 6.2 + 16.0).ceil()
+}
+
+fn status_label_y() -> f64 {
+    (STATUS_HEIGHT - STATUS_LABEL_HEIGHT) / 2.0
+}
+
+fn status_control_y() -> f64 {
+    (STATUS_HEIGHT - STATUS_CONTROL_HEIGHT) / 2.0
 }
 
 fn menu_item(
