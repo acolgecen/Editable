@@ -3,7 +3,7 @@
 mod app_state;
 mod selection;
 
-use app_state::EditableState;
+use app_state::{EditableState, SelectionMetric};
 use editable_csv_core::{FilterOperator, FilterRule, SortDirection, SortKey};
 use objc2::ffi::{NSInteger, NSUInteger};
 use objc2::rc::Retained;
@@ -34,7 +34,13 @@ use std::ptr;
 
 const TOOLBAR_HEIGHT: f64 = 44.0;
 const TOOLBAR_BUTTON_HEIGHT: f64 = 28.0;
+const TOOLBAR_HORIZONTAL_PADDING: f64 = 12.0;
+const TOOLBAR_VERTICAL_PADDING: f64 = 8.0;
+const TOOLBAR_BUTTON_GAP: f64 = 8.0;
+const TOOLBAR_ROW_GAP: f64 = 6.0;
 const STATUS_HEIGHT: f64 = 24.0;
+const STATUS_SIDE_PADDING: f64 = 12.0;
+const STATUS_LABEL_GAP: f64 = 12.0;
 const MAX_VISIBLE_COLUMNS: usize = 1_024;
 const ROW_NUMBER_COLUMN: &str = "__row_number__";
 const APPLE_ACCENT_COLOR_KEY: &str = "AppleAccentColor";
@@ -206,7 +212,11 @@ struct AppDelegateIvars {
     window: OnceCell<Retained<NSWindow>>,
     window_delegates: RefCell<Vec<Retained<Delegate>>>,
     table: OnceCell<Retained<EditableTableView>>,
+    toolbar: OnceCell<Retained<NSView>>,
+    scroll: OnceCell<Retained<NSScrollView>>,
     status: OnceCell<Retained<NSTextField>>,
+    selection_status: OnceCell<Retained<NSPopUpButton>>,
+    selected_selection_metric: RefCell<SelectionMetric>,
     sort_filter_panel: RefCell<Option<SortFilterPanel>>,
     formatting_panel: RefCell<Option<FormattingPanel>>,
     drag_selection: RefCell<Option<DragSelection>>,
@@ -490,6 +500,11 @@ define_class!(
             self.ivars().sort_filter_panel.replace(None);
             self.ivars().formatting_panel.replace(None);
         }
+
+        #[unsafe(method(windowDidResize:))]
+        fn window_did_resize(&self, _notification: &NSNotification) {
+            self.layout_main_views();
+        }
     }
 
     impl Delegate {
@@ -719,6 +734,23 @@ define_class!(
         #[unsafe(method(formattingSeparatorChanged:))]
         fn formatting_separator_changed(&self, _sender: &AnyObject) {
             self.update_custom_delimiter_visibility();
+        }
+
+        #[unsafe(method(selectionMetricChanged:))]
+        fn selection_metric_changed(&self, sender: &AnyObject) {
+            let Some(popup) = sender.downcast_ref::<NSPopUpButton>() else {
+                return;
+            };
+            let index = popup.indexOfSelectedItem();
+            if index < 0 {
+                return;
+            }
+            let stats = self.ivars().state.borrow().selection_stats();
+            if let Some(stat) = stats.get(index as usize) {
+                self.ivars()
+                    .selected_selection_metric
+                    .replace(stat.metric);
+            }
         }
 
         #[unsafe(method(addSortRule:))]
@@ -1019,23 +1051,26 @@ impl Delegate {
         window.setRestorable(false);
         window.disableSnapshotRestoration();
         window.setTitle(&NSString::from_str(&self.ivars().state.borrow().title()));
-        window.setContentMinSize(NSSize::new(860.0, 520.0));
+        window.setContentMinSize(NSSize::new(520.0, 520.0));
 
         let content = window
             .contentView()
             .expect("window must have a content view");
         let toolbar = self.make_toolbar(mtm);
         let status = self.make_status(mtm);
+        let selection_status = self.make_selection_status(mtm);
         let scroll = self.make_table_area(mtm);
         content.addSubview(&toolbar);
         content.addSubview(&scroll);
         content.addSubview(&status);
+        content.addSubview(&selection_status);
 
         window.center();
         window.setDelegate(Some(ProtocolObject::from_ref(self)));
         window.makeKeyAndOrderFront(None);
 
         self.ivars().window.set(window).ok();
+        self.layout_main_views();
         self.rebuild_columns();
         self.refresh_table();
     }
@@ -1376,9 +1411,9 @@ impl Delegate {
         app.setMainMenu(Some(&main_menu));
     }
 
-    fn make_toolbar(&self, mtm: MainThreadMarker) -> Retained<objc2_app_kit::NSView> {
-        let toolbar = objc2_app_kit::NSView::initWithFrame(
-            objc2_app_kit::NSView::alloc(mtm),
+    fn make_toolbar(&self, mtm: MainThreadMarker) -> Retained<NSView> {
+        let toolbar = NSView::initWithFrame(
+            NSView::alloc(mtm),
             NSRect::new(
                 NSPoint::new(0.0, 696.0),
                 NSSize::new(1120.0, TOOLBAR_HEIGHT),
@@ -1451,6 +1486,7 @@ impl Delegate {
             ));
         }
 
+        self.ivars().toolbar.set(toolbar.clone()).ok();
         toolbar
     }
 
@@ -1467,6 +1503,26 @@ impl Delegate {
             NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewMaxYMargin,
         );
         self.ivars().status.set(status.clone()).ok();
+        status
+    }
+
+    fn make_selection_status(&self, mtm: MainThreadMarker) -> Retained<NSPopUpButton> {
+        let status = NSPopUpButton::initWithFrame_pullsDown(
+            NSPopUpButton::alloc(mtm),
+            NSRect::new(NSPoint::new(12.0, 2.0), NSSize::new(160.0, 22.0)),
+            false,
+        );
+        status.setBezelStyle(NSBezelStyle::Toolbar);
+        status.setFont(Some(&NSFont::systemFontOfSize(11.0)));
+        status.setHidden(true);
+        unsafe {
+            status.setTarget(Some(any_ref(self)));
+            status.setAction(Some(sel!(selectionMetricChanged:)));
+        }
+        status.setAutoresizingMask(
+            NSAutoresizingMaskOptions::ViewMinXMargin | NSAutoresizingMaskOptions::ViewMaxYMargin,
+        );
+        self.ivars().selection_status.set(status.clone()).ok();
         status
     }
 
@@ -1517,6 +1573,7 @@ impl Delegate {
         scroll.setDocumentView(Some(&table));
 
         self.ivars().table.set(table).ok();
+        self.ivars().scroll.set(scroll.clone()).ok();
         scroll
     }
 
@@ -2055,6 +2112,8 @@ impl Delegate {
                 &self.ivars().state.borrow().status_text(),
             ));
         }
+        self.update_selection_stats_button();
+        self.layout_status_labels();
         if let Some(window) = self.ivars().window.get() {
             let state = self.ivars().state.borrow();
             window.setTitle(&NSString::from_str(&state.title()));
@@ -2064,6 +2123,117 @@ impl Delegate {
                     .as_ref()
                     .is_some_and(editable_csv_core::CsvDocument::is_dirty),
             );
+        }
+    }
+
+    fn update_selection_stats_button(&self) {
+        let Some(selection_status) = self.ivars().selection_status.get() else {
+            return;
+        };
+        let stats = self.ivars().state.borrow().selection_stats();
+        selection_status.removeAllItems();
+        if stats.is_empty() {
+            selection_status.setHidden(true);
+            return;
+        }
+
+        for stat in &stats {
+            selection_status.addItemWithTitle(&NSString::from_str(&stat.display_text()));
+        }
+
+        let preferred = *self.ivars().selected_selection_metric.borrow();
+        let selected_index = stats
+            .iter()
+            .position(|stat| stat.metric == preferred)
+            .unwrap_or(0);
+        self.ivars()
+            .selected_selection_metric
+            .replace(stats[selected_index].metric);
+        selection_status.selectItemAtIndex(selected_index as NSInteger);
+    }
+
+    fn layout_main_views(&self) {
+        let Some(window) = self.ivars().window.get() else {
+            return;
+        };
+        let Some(content) = window.contentView() else {
+            return;
+        };
+        let frame = content.frame();
+        let width = frame.size.width.max(0.0);
+        let height = frame.size.height.max(0.0);
+        let toolbar_height = self.layout_toolbar(width);
+
+        if let Some(toolbar) = self.ivars().toolbar.get() {
+            toolbar.setFrame(NSRect::new(
+                NSPoint::new(0.0, (height - toolbar_height).max(0.0)),
+                NSSize::new(width, toolbar_height),
+            ));
+        }
+
+        if let Some(scroll) = self.ivars().scroll.get() {
+            scroll.setFrame(NSRect::new(
+                NSPoint::new(0.0, STATUS_HEIGHT),
+                NSSize::new(width, (height - STATUS_HEIGHT - toolbar_height).max(0.0)),
+            ));
+        }
+
+        self.layout_status_labels();
+    }
+
+    fn layout_toolbar(&self, width: f64) -> f64 {
+        let Some(toolbar) = self.ivars().toolbar.get() else {
+            return TOOLBAR_HEIGHT;
+        };
+        let rows = toolbar_row_count(toolbar, width);
+        let height = toolbar_height_for_rows(rows);
+        layout_toolbar_buttons(toolbar, width, height);
+        height
+    }
+
+    fn layout_status_labels(&self) {
+        let Some(window) = self.ivars().window.get() else {
+            return;
+        };
+        let Some(content) = window.contentView() else {
+            return;
+        };
+        let width = content.frame().size.width.max(0.0);
+        let available = (width - STATUS_SIDE_PADDING * 2.0).max(0.0);
+        let stats_text = self
+            .ivars()
+            .selection_status
+            .get()
+            .and_then(|status| status.titleOfSelectedItem())
+            .map(|title| title.to_string())
+            .unwrap_or_default();
+        let stats_width = if stats_text.is_empty() {
+            0.0
+        } else if available < 116.0 {
+            available
+        } else {
+            estimated_status_text_width(&stats_text).clamp(116.0, available)
+        };
+
+        if let Some(selection_status) = self.ivars().selection_status.get() {
+            selection_status.setHidden(stats_text.is_empty());
+            selection_status.setFrame(NSRect::new(
+                NSPoint::new(STATUS_SIDE_PADDING + available - stats_width, 1.0),
+                NSSize::new(stats_width, STATUS_HEIGHT - 2.0),
+            ));
+        }
+
+        if let Some(status) = self.ivars().status.get() {
+            let left_width = if stats_text.is_empty() {
+                available
+            } else {
+                (available - stats_width - STATUS_LABEL_GAP).max(0.0)
+            };
+            status.setHidden(left_width < 32.0);
+            status.setFrame(NSRect::new(
+                NSPoint::new(STATUS_SIDE_PADDING, 2.0),
+                NSSize::new(left_width, STATUS_HEIGHT),
+            ));
         }
     }
 
@@ -2629,6 +2799,57 @@ fn toolbar_button(
     }
 
     button
+}
+
+fn toolbar_row_count(toolbar: &NSView, width: f64) -> usize {
+    let subviews = toolbar.subviews();
+    if subviews.count() == 0 {
+        return 1;
+    }
+
+    let mut rows = 1;
+    let mut x = TOOLBAR_HORIZONTAL_PADDING;
+    let max_x = (width - TOOLBAR_HORIZONTAL_PADDING).max(TOOLBAR_HORIZONTAL_PADDING);
+    for idx in 0..subviews.count() {
+        let view = subviews.objectAtIndex(idx);
+        let view_width = view.frame().size.width;
+        if idx > 0 && x + view_width > max_x {
+            rows += 1;
+            x = TOOLBAR_HORIZONTAL_PADDING;
+        }
+        x += view_width + TOOLBAR_BUTTON_GAP;
+    }
+    rows
+}
+
+fn toolbar_height_for_rows(rows: usize) -> f64 {
+    TOOLBAR_VERTICAL_PADDING * 2.0
+        + rows as f64 * TOOLBAR_BUTTON_HEIGHT
+        + rows.saturating_sub(1) as f64 * TOOLBAR_ROW_GAP
+}
+
+fn layout_toolbar_buttons(toolbar: &NSView, width: f64, height: f64) {
+    let subviews = toolbar.subviews();
+    let mut x = TOOLBAR_HORIZONTAL_PADDING;
+    let mut y = height - TOOLBAR_VERTICAL_PADDING - TOOLBAR_BUTTON_HEIGHT;
+    let max_x = (width - TOOLBAR_HORIZONTAL_PADDING).max(TOOLBAR_HORIZONTAL_PADDING);
+    for idx in 0..subviews.count() {
+        let view = subviews.objectAtIndex(idx);
+        let view_width = view.frame().size.width;
+        if idx > 0 && x + view_width > max_x {
+            x = TOOLBAR_HORIZONTAL_PADDING;
+            y -= TOOLBAR_BUTTON_HEIGHT + TOOLBAR_ROW_GAP;
+        }
+        view.setFrame(NSRect::new(
+            NSPoint::new(x, y.max(TOOLBAR_VERTICAL_PADDING)),
+            NSSize::new(view_width, TOOLBAR_BUTTON_HEIGHT),
+        ));
+        x += view_width + TOOLBAR_BUTTON_GAP;
+    }
+}
+
+fn estimated_status_text_width(text: &str) -> f64 {
+    (text.chars().count() as f64 * 6.2 + 16.0).ceil()
 }
 
 fn menu_item(

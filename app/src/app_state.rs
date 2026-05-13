@@ -3,11 +3,59 @@ use editable_csv_core::{
     ColumnFilter, CsvDocument, CsvDocumentSnapshot, FilterRule, OpenOptions, Result, SortDirection,
     SortKey,
 };
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 const MAX_UNDO_HISTORY: usize = 10;
 const BLANK_DOCUMENT_ROWS: usize = 25;
 const BLANK_DOCUMENT_COLUMNS: usize = 10;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionMetric {
+    Values,
+    Blanks,
+    Distinct,
+    Total,
+    Minimum,
+    Average,
+    Median,
+    Maximum,
+    Summary,
+}
+
+impl SelectionMetric {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Values => "Values",
+            Self::Blanks => "Blanks",
+            Self::Distinct => "Distinct",
+            Self::Total => "Total",
+            Self::Minimum => "Minimum",
+            Self::Average => "Average",
+            Self::Median => "Median",
+            Self::Maximum => "Maximum",
+            Self::Summary => "Summary",
+        }
+    }
+}
+
+impl Default for SelectionMetric {
+    fn default() -> Self {
+        Self::Values
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectionStat {
+    pub metric: SelectionMetric,
+    pub value: String,
+}
+
+impl SelectionStat {
+    pub fn display_text(&self) -> String {
+        format!("{}: {}", self.metric.label(), self.value)
+    }
+}
 
 #[derive(Clone, PartialEq, Eq)]
 struct HistoryEntry {
@@ -152,24 +200,70 @@ impl EditableState {
             return "Open a CSV file to start editing.".to_string();
         };
         let stats = doc.edit_stats();
-        let edited = if doc.is_dirty() {
-            format!(
-                " - edited: {} cells, +{} rows, -{} rows, +{} columns, -{} columns",
-                stats.edited_cells,
-                stats.inserted_rows,
-                stats.deleted_rows,
-                stats.inserted_columns,
-                stats.deleted_columns
-            )
-        } else {
-            String::new()
-        };
+        let edited = edit_stats_text(stats, doc.is_dirty());
         format!(
             "{} rows x {} columns{}",
             doc.row_count(),
             doc.column_count(),
             edited
         )
+    }
+
+    pub fn selection_stats(&self) -> Vec<SelectionStat> {
+        let Some(doc) = self.document.as_ref() else {
+            return Vec::new();
+        };
+        let mut values = Vec::new();
+        let row_count = doc.row_count();
+        let column_count = doc.column_count();
+        if row_count == 0 || column_count == 0 {
+            return Vec::new();
+        }
+
+        match &self.selection {
+            Selection::Cells { cells, .. } => {
+                for cell in cells {
+                    if cell.row < row_count && cell.column < column_count {
+                        values.push(doc.cell(cell.row, cell.column).unwrap_or_default());
+                    }
+                }
+            }
+            Selection::Cell(rect) => {
+                let (top, left, bottom, right) = rect.bounds();
+                for row in top..=bottom.min(row_count - 1) {
+                    for column in left..=right.min(column_count - 1) {
+                        values.push(doc.cell(row, column).unwrap_or_default());
+                    }
+                }
+            }
+            Selection::Row { anchor, focus } => {
+                let top = (*anchor).min(*focus);
+                let bottom = (*anchor).max(*focus).min(row_count - 1);
+                for row in top..=bottom {
+                    for column in 0..column_count {
+                        values.push(doc.cell(row, column).unwrap_or_default());
+                    }
+                }
+            }
+            Selection::Column { anchor, focus } => {
+                let left = (*anchor).min(*focus);
+                let right = (*anchor).max(*focus).min(column_count - 1);
+                for row in 0..row_count {
+                    for column in left..=right {
+                        values.push(doc.cell(row, column).unwrap_or_default());
+                    }
+                }
+            }
+            Selection::All => {
+                for row in 0..row_count {
+                    for column in 0..column_count {
+                        values.push(doc.cell(row, column).unwrap_or_default());
+                    }
+                }
+            }
+        }
+
+        selection_stats(values)
     }
 
     pub fn column_title(&self, column: usize) -> String {
@@ -548,6 +642,183 @@ fn fit(value: &str, width: usize) -> String {
     format!("{out:width$}")
 }
 
+fn edit_stats_text(stats: editable_csv_core::EditStats, dirty: bool) -> String {
+    if !dirty {
+        return String::new();
+    }
+
+    let mut changes = Vec::new();
+    if stats.edited_cells > 0 {
+        changes.push(format!(
+            "{} {}",
+            stats.edited_cells,
+            plural("cell", stats.edited_cells)
+        ));
+    }
+    if stats.inserted_rows > 0 {
+        changes.push(format!(
+            "+{} {}",
+            stats.inserted_rows,
+            plural("row", stats.inserted_rows)
+        ));
+    }
+    if stats.deleted_rows > 0 {
+        changes.push(format!(
+            "-{} {}",
+            stats.deleted_rows,
+            plural("row", stats.deleted_rows)
+        ));
+    }
+    if stats.inserted_columns > 0 {
+        changes.push(format!(
+            "+{} {}",
+            stats.inserted_columns,
+            plural("column", stats.inserted_columns)
+        ));
+    }
+    if stats.deleted_columns > 0 {
+        changes.push(format!(
+            "-{} {}",
+            stats.deleted_columns,
+            plural("column", stats.deleted_columns)
+        ));
+    }
+
+    if changes.is_empty() {
+        " - edited".to_string()
+    } else {
+        format!(" - edited: {}", changes.join(", "))
+    }
+}
+
+fn selection_stats(values: Vec<String>) -> Vec<SelectionStat> {
+    let total = values.len();
+    if total <= 1 {
+        return Vec::new();
+    }
+
+    let mut filled = 0;
+    let mut distinct = HashSet::new();
+    let mut numbers = Vec::new();
+    let mut all_filled_values_are_numbers = true;
+
+    for value in values {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        filled += 1;
+        distinct.insert(trimmed.to_string());
+        match trimmed.parse::<f64>() {
+            Ok(number) if number.is_finite() => numbers.push(number),
+            _ => all_filled_values_are_numbers = false,
+        }
+    }
+
+    let empty = total - filled;
+    if filled > 0 && all_filled_values_are_numbers {
+        numbers.sort_by(|a, b| a.total_cmp(b));
+        let sum: f64 = numbers.iter().sum();
+        let average = sum / numbers.len() as f64;
+        let median = if numbers.len() % 2 == 0 {
+            let upper = numbers.len() / 2;
+            (numbers[upper - 1] + numbers[upper]) / 2.0
+        } else {
+            numbers[numbers.len() / 2]
+        };
+        vec![
+            SelectionStat {
+                metric: SelectionMetric::Values,
+                value: filled.to_string(),
+            },
+            SelectionStat {
+                metric: SelectionMetric::Blanks,
+                value: empty.to_string(),
+            },
+            SelectionStat {
+                metric: SelectionMetric::Distinct,
+                value: distinct.len().to_string(),
+            },
+            SelectionStat {
+                metric: SelectionMetric::Total,
+                value: total.to_string(),
+            },
+            SelectionStat {
+                metric: SelectionMetric::Minimum,
+                value: format_stat_number(*numbers.first().unwrap_or(&0.0)),
+            },
+            SelectionStat {
+                metric: SelectionMetric::Average,
+                value: format_stat_number(average),
+            },
+            SelectionStat {
+                metric: SelectionMetric::Median,
+                value: format_stat_number(median),
+            },
+            SelectionStat {
+                metric: SelectionMetric::Maximum,
+                value: format_stat_number(*numbers.last().unwrap_or(&0.0)),
+            },
+            SelectionStat {
+                metric: SelectionMetric::Summary,
+                value: format_stat_number(sum),
+            },
+        ]
+    } else {
+        vec![
+            SelectionStat {
+                metric: SelectionMetric::Values,
+                value: filled.to_string(),
+            },
+            SelectionStat {
+                metric: SelectionMetric::Blanks,
+                value: empty.to_string(),
+            },
+            SelectionStat {
+                metric: SelectionMetric::Distinct,
+                value: distinct.len().to_string(),
+            },
+            SelectionStat {
+                metric: SelectionMetric::Total,
+                value: total.to_string(),
+            },
+        ]
+    }
+}
+
+fn format_stat_number(value: f64) -> String {
+    let value = if value.abs() < 0.000_000_001 {
+        0.0
+    } else {
+        value
+    };
+    if value.fract().abs() < 0.000_000_001 {
+        return format!("{value:.0}");
+    }
+
+    let mut text = format!("{value:.4}");
+    while text.contains('.') && text.ends_with('0') {
+        text.pop();
+    }
+    if text.ends_with('.') {
+        text.pop();
+    }
+    text
+}
+
+fn plural(word: &str, count: usize) -> &'static str {
+    match (word, count == 1) {
+        ("cell", true) => "cell",
+        ("cell", false) => "cells",
+        ("row", true) => "row",
+        ("row", false) => "rows",
+        ("column", true) => "column",
+        ("column", false) => "columns",
+        _ => "items",
+    }
+}
+
 fn spreadsheet_column_name(mut column: usize) -> String {
     let mut name = String::new();
     loop {
@@ -724,5 +995,64 @@ mod tests {
         let doc = state.document.as_ref().unwrap();
         assert!(doc.is_dirty());
         assert_eq!(doc.cell(0, 0).unwrap(), "kept");
+    }
+
+    #[test]
+    fn status_text_only_shows_nonzero_edit_counts() {
+        let mut state = state_with_sample();
+        state.select_cell(0, 0);
+        state.set_cell("Augusta").unwrap();
+
+        assert_eq!(state.status_text(), "3 rows x 2 columns - edited: 1 cell");
+    }
+
+    #[test]
+    fn numeric_selection_stats_include_summary_values() {
+        let mut state = EditableState::default();
+        state.document = Some(
+            CsvDocument::from_bytes(b"a,b,c\n1,2,\n3,4,5\n".to_vec(), OpenOptions::default())
+                .unwrap(),
+        );
+        state.selection = Selection::single_cell(Cell { row: 0, column: 0 });
+        state.selection.select_rect_to(Cell { row: 1, column: 2 });
+
+        assert_eq!(
+            state
+                .selection_stats()
+                .iter()
+                .map(SelectionStat::display_text)
+                .collect::<Vec<_>>(),
+            [
+                "Values: 5",
+                "Blanks: 1",
+                "Distinct: 5",
+                "Total: 6",
+                "Minimum: 1",
+                "Average: 3",
+                "Median: 3",
+                "Maximum: 5",
+                "Summary: 15",
+            ]
+            .map(String::from)
+            .to_vec()
+        );
+    }
+
+    #[test]
+    fn mixed_selection_stats_use_blank_counts() {
+        let mut state = state_with_sample();
+        state.selection = Selection::single_cell(Cell { row: 0, column: 0 });
+        state.selection.select_rect_to(Cell { row: 1, column: 1 });
+
+        assert_eq!(
+            state
+                .selection_stats()
+                .iter()
+                .map(SelectionStat::display_text)
+                .collect::<Vec<_>>(),
+            ["Values: 4", "Blanks: 0", "Distinct: 4", "Total: 4"]
+                .map(String::from)
+                .to_vec()
+        );
     }
 }
