@@ -223,7 +223,7 @@ impl CsvDocument {
     }
 
     pub fn row_count(&self) -> usize {
-        self.visible_source_row_count() + self.inserted_rows.len()
+        self.visible_storage_row_count()
     }
 
     pub fn column_count(&self) -> usize {
@@ -231,7 +231,6 @@ impl CsvDocument {
             .iter()
             .filter(|column| !self.deleted_columns.contains(column))
             .count()
-            + self.inserted_columns.len()
     }
 
     pub fn edit_stats(&self) -> EditStats {
@@ -282,9 +281,7 @@ impl CsvDocument {
             return Some(value.clone());
         }
 
-        let visible_source_rows = self.visible_source_row_count();
-        if row >= visible_source_rows {
-            let inserted = row.checked_sub(visible_source_rows)?;
+        if let Some(inserted) = self.inserted_row_index(storage_row) {
             return self
                 .inserted_rows
                 .get(inserted)
@@ -292,11 +289,10 @@ impl CsvDocument {
                 .or_else(|| Some(String::new()));
         }
 
-        let data_row = self.visible_data_row_at(row)?;
-        if self.deleted_rows.contains(&data_row) {
+        if self.deleted_rows.contains(&storage_row) {
             return None;
         }
-        let record_idx = *self.data_rows.get(data_row)?;
+        let record_idx = *self.data_rows.get(storage_row)?;
         let record = self.records.get(record_idx)?;
         record
             .fields
@@ -326,10 +322,10 @@ impl CsvDocument {
             return Err(CsvError::InvalidRow { row: at });
         }
         let row = vec![String::new(); self.column_count()];
-        let insert_at = at
-            .saturating_sub(self.visible_source_row_count())
-            .min(self.inserted_rows.len());
-        self.inserted_rows.insert(insert_at, row);
+        let storage_row = self.data_rows.len() + self.inserted_rows.len();
+        self.inserted_rows.push(row);
+        let view_index = self.view_index_for_visible_insertion(at);
+        self.view_rows.insert(view_index, storage_row);
         self.dirty = true;
         Ok(())
     }
@@ -338,11 +334,18 @@ impl CsvDocument {
         if row >= self.row_count() {
             return Err(CsvError::InvalidRow { row });
         }
-        let visible_source_rows = self.visible_source_row_count();
-        if row >= visible_source_rows {
-            self.inserted_rows.remove(row - visible_source_rows);
-        } else if let Some(data_row) = self.visible_data_row_at(row) {
-            self.deleted_rows.insert(data_row);
+        let storage_row = self.storage_row(row).ok_or(CsvError::InvalidRow { row })?;
+        if let Some(inserted) = self.inserted_row_index(storage_row) {
+            self.inserted_rows.remove(inserted);
+            self.view_rows.retain(|row| *row != storage_row);
+            for row in &mut self.view_rows {
+                if *row > storage_row {
+                    *row -= 1;
+                }
+            }
+            self.shift_inserted_row_edits_after_delete(storage_row);
+        } else {
+            self.deleted_rows.insert(storage_row);
         }
         self.dirty = true;
         Ok(())
@@ -352,7 +355,13 @@ impl CsvDocument {
         if at > self.column_count() {
             return Err(CsvError::InvalidColumn { column: at });
         }
-        let new_column = self.column_order.len() + self.inserted_columns.len();
+        let new_column = self
+            .column_order
+            .iter()
+            .copied()
+            .max()
+            .map(|column| column + 1)
+            .unwrap_or(0);
         self.column_order
             .insert(at.min(self.column_order.len()), new_column);
         self.inserted_columns
@@ -371,21 +380,21 @@ impl CsvDocument {
     }
 
     pub fn reorder_row(&mut self, from: usize, to: usize) -> Result<()> {
-        let Some(from_data_row) = self.visible_data_row_at(from) else {
+        let Some(from_storage_row) = self.storage_row(from) else {
             return Err(CsvError::InvalidReorder { from, to });
         };
-        let Some(to_data_row) = self.visible_data_row_at(to) else {
+        let Some(to_storage_row) = self.storage_row(to) else {
             return Err(CsvError::InvalidReorder { from, to });
         };
         let from_idx = self
             .view_rows
             .iter()
-            .position(|row| *row == from_data_row)
+            .position(|row| *row == from_storage_row)
             .ok_or(CsvError::InvalidReorder { from, to })?;
         let to_idx = self
             .view_rows
             .iter()
-            .position(|row| *row == to_data_row)
+            .position(|row| *row == to_storage_row)
             .ok_or(CsvError::InvalidReorder { from, to })?;
         let row = self.view_rows.remove(from_idx);
         self.view_rows.insert(to_idx, row);
@@ -598,30 +607,76 @@ impl CsvDocument {
             let keys = self.sort_keys.clone();
             rows.par_sort_by(|left, right| self.compare_rows(*left, *right, &keys));
         }
+        let inserted_rows = self
+            .view_rows
+            .iter()
+            .copied()
+            .filter(|row| self.inserted_row_index(*row).is_some())
+            .collect::<Vec<_>>();
+        rows.extend(inserted_rows);
         self.view_rows = rows;
     }
 
-    fn visible_source_row_count(&self) -> usize {
+    fn visible_storage_row_count(&self) -> usize {
         self.view_rows
             .iter()
-            .filter(|row| !self.deleted_rows.contains(row))
+            .filter(|row| self.storage_row_is_visible(**row))
             .count()
     }
 
-    fn visible_data_row_at(&self, visible_row: usize) -> Option<usize> {
+    fn visible_storage_row_at(&self, visible_row: usize) -> Option<usize> {
         self.view_rows
             .iter()
             .copied()
-            .filter(|row| !self.deleted_rows.contains(row))
+            .filter(|row| self.storage_row_is_visible(*row))
             .nth(visible_row)
     }
 
     fn storage_row(&self, visible_row: usize) -> Option<usize> {
-        if visible_row < self.visible_source_row_count() {
-            return self.visible_data_row_at(visible_row);
+        self.visible_storage_row_at(visible_row)
+    }
+
+    fn storage_row_is_visible(&self, storage_row: usize) -> bool {
+        if storage_row < self.data_rows.len() {
+            !self.deleted_rows.contains(&storage_row)
+        } else {
+            self.inserted_row_index(storage_row).is_some()
         }
-        let inserted = visible_row.checked_sub(self.visible_source_row_count())?;
-        (inserted < self.inserted_rows.len()).then_some(self.data_rows.len() + inserted)
+    }
+
+    fn inserted_row_index(&self, storage_row: usize) -> Option<usize> {
+        let inserted = storage_row.checked_sub(self.data_rows.len())?;
+        (inserted < self.inserted_rows.len()).then_some(inserted)
+    }
+
+    fn view_index_for_visible_insertion(&self, visible_row: usize) -> usize {
+        if visible_row >= self.row_count() {
+            return self.view_rows.len();
+        }
+        self.view_rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| self.storage_row_is_visible(**row))
+            .nth(visible_row)
+            .map(|(index, _)| index)
+            .unwrap_or(self.view_rows.len())
+    }
+
+    fn shift_inserted_row_edits_after_delete(&mut self, deleted_storage_row: usize) {
+        self.edits = self
+            .edits
+            .drain()
+            .filter_map(|(mut coord, value)| {
+                if coord.row == deleted_storage_row {
+                    None
+                } else {
+                    if coord.row > deleted_storage_row {
+                        coord.row -= 1;
+                    }
+                    Some((coord, value))
+                }
+            })
+            .collect();
     }
 
     fn row_matches_filters(&self, data_row: usize) -> bool {
@@ -1045,6 +1100,24 @@ mod tests {
         assert_eq!(doc.cell(0, 0).unwrap(), "4");
         doc.delete_row(0).unwrap();
         assert_eq!(doc.row_count(), 1);
+    }
+
+    #[test]
+    fn insert_row_uses_visible_position() {
+        let mut doc = CsvDocument::from_bytes(
+            b"name,age\nAda,36\nGrace,85\nAlan,41\n".to_vec(),
+            OpenOptions::default(),
+        )
+        .unwrap();
+
+        doc.insert_row(1).unwrap();
+        doc.set_cell(1, 0, "Inserted").unwrap();
+
+        assert_eq!(doc.row_count(), 4);
+        assert_eq!(doc.cell(0, 0).unwrap(), "Ada");
+        assert_eq!(doc.cell(1, 0).unwrap(), "Inserted");
+        assert_eq!(doc.cell(2, 0).unwrap(), "Grace");
+        assert_eq!(doc.cell(3, 0).unwrap(), "Alan");
     }
 
     #[test]

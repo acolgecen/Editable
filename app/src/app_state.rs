@@ -289,8 +289,13 @@ impl EditableState {
 
     pub fn insert_row(&mut self) -> Result<()> {
         self.record_undoable(|state| {
-            let row = state.selection.active_cell().row;
             if let Some(doc) = &mut state.document {
+                let row = state
+                    .selection
+                    .top_left_cell()
+                    .row
+                    .saturating_add(1)
+                    .min(doc.row_count());
                 doc.insert_row(row)?;
             }
             Ok(())
@@ -299,12 +304,78 @@ impl EditableState {
 
     pub fn insert_column(&mut self) -> Result<()> {
         self.record_undoable(|state| {
-            let column = state.selection.active_cell().column;
             if let Some(doc) = &mut state.document {
+                let column = state
+                    .selection
+                    .top_left_cell()
+                    .column
+                    .saturating_add(1)
+                    .min(doc.column_count());
                 doc.insert_column(column)?;
             }
             Ok(())
         })
+    }
+
+    pub fn clear_selection_content(&mut self) -> Result<()> {
+        self.record_undoable(|state| {
+            let selection = state.selection.clone();
+            if let Some(doc) = &mut state.document {
+                let Some((top, left, bottom, right)) =
+                    selection_bounds(&selection, doc.row_count(), doc.column_count())
+                else {
+                    return Ok(());
+                };
+                for row in top..=bottom {
+                    for column in left..=right {
+                        if selection.contains_cell(row, column) {
+                            doc.set_cell(row, column, "")?;
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
+    pub fn selected_text(&self) -> Option<String> {
+        let doc = self.document.as_ref()?;
+        let (top, left, bottom, right) =
+            selection_bounds(&self.selection, doc.row_count(), doc.column_count())?;
+        let mut rows = Vec::new();
+        for row in top..=bottom {
+            let mut values = Vec::new();
+            for column in left..=right {
+                values.push(if self.selection.contains_cell(row, column) {
+                    doc.cell(row, column).unwrap_or_default()
+                } else {
+                    String::new()
+                });
+            }
+            rows.push(values.join("\t"));
+        }
+        Some(rows.join("\n"))
+    }
+
+    pub fn find_matches(&self, query: &str) -> Vec<Cell> {
+        let query = query.trim().to_lowercase();
+        if query.is_empty() {
+            return Vec::new();
+        }
+        let Some(doc) = self.document.as_ref() else {
+            return Vec::new();
+        };
+
+        let mut matches = Vec::new();
+        for row in 0..doc.row_count() {
+            for column in 0..doc.column_count() {
+                let value = doc.cell(row, column).unwrap_or_default();
+                if value.to_lowercase().contains(&query) {
+                    matches.push(Cell { row, column });
+                }
+            }
+        }
+        matches
     }
 
     pub fn delete_selection(&mut self) -> Result<()> {
@@ -624,6 +695,61 @@ fn blank_csv_bytes(records: usize, columns: usize, delimiter: u8) -> Vec<u8> {
         .collect::<Vec<_>>()
         .join("\n")
         .into_bytes()
+}
+
+fn selection_bounds(
+    selection: &Selection,
+    row_count: usize,
+    column_count: usize,
+) -> Option<(usize, usize, usize, usize)> {
+    if row_count == 0 || column_count == 0 {
+        return None;
+    }
+
+    match selection {
+        Selection::Cells { active, cells, .. } => {
+            let mut iter = cells
+                .iter()
+                .copied()
+                .filter(|cell| cell.row < row_count && cell.column < column_count);
+            let first = iter.next().or_else(|| {
+                (active.row < row_count && active.column < column_count).then_some(*active)
+            })?;
+            let mut top = first.row;
+            let mut bottom = first.row;
+            let mut left = first.column;
+            let mut right = first.column;
+            for cell in iter {
+                top = top.min(cell.row);
+                bottom = bottom.max(cell.row);
+                left = left.min(cell.column);
+                right = right.max(cell.column);
+            }
+            Some((top, left, bottom, right))
+        }
+        Selection::Cell(rect) => {
+            let (top, left, bottom, right) = rect.bounds();
+            Some((
+                top.min(row_count - 1),
+                left.min(column_count - 1),
+                bottom.min(row_count - 1),
+                right.min(column_count - 1),
+            ))
+        }
+        Selection::Row { anchor, focus } => Some((
+            (*anchor).min(*focus).min(row_count - 1),
+            0,
+            (*anchor).max(*focus).min(row_count - 1),
+            column_count - 1,
+        )),
+        Selection::Column { anchor, focus } => Some((
+            0,
+            (*anchor).min(*focus).min(column_count - 1),
+            row_count - 1,
+            (*anchor).max(*focus).min(column_count - 1),
+        )),
+        Selection::All => Some((0, 0, row_count - 1, column_count - 1)),
+    }
 }
 
 fn fit(value: &str, width: usize) -> String {
@@ -1054,5 +1180,75 @@ mod tests {
                 .map(String::from)
                 .to_vec()
         );
+    }
+
+    #[test]
+    fn selected_text_is_tabular_text_from_selection_bounds() {
+        let mut state = state_with_sample();
+        state.selection = Selection::single_cell(Cell { row: 0, column: 0 });
+        state.selection.select_rect_to(Cell { row: 1, column: 1 });
+
+        assert_eq!(state.selected_text().unwrap(), "Ada\t36\nGrace\t85");
+    }
+
+    #[test]
+    fn clear_selection_content_keeps_rows_and_columns() {
+        let mut state = state_with_sample();
+        state.select_column(0);
+
+        state.clear_selection_content().unwrap();
+
+        let doc = state.document.as_ref().unwrap();
+        assert_eq!(doc.row_count(), 3);
+        assert_eq!(doc.column_count(), 2);
+        assert_eq!(doc.cell(0, 0).unwrap(), "");
+        assert_eq!(doc.cell(1, 0).unwrap(), "");
+        assert_eq!(doc.cell(2, 0).unwrap(), "");
+        assert_eq!(doc.cell(0, 1).unwrap(), "36");
+    }
+
+    #[test]
+    fn insert_column_uses_top_left_selected_cell() {
+        let mut state = state_with_sample();
+        state.select_cell_range_from(Cell { row: 2, column: 1 }, 1, 0);
+
+        state.insert_column().unwrap();
+
+        let doc = state.document.as_ref().unwrap();
+        assert_eq!(doc.column_count(), 3);
+        assert_eq!(doc.cell(0, 0).unwrap(), "Ada");
+        assert_eq!(doc.cell(0, 1).unwrap(), "");
+        assert_eq!(doc.cell(0, 2).unwrap(), "36");
+    }
+
+    #[test]
+    fn insert_row_uses_top_left_selected_cell() {
+        let mut state = state_with_sample();
+        state.select_cell_range_from(Cell { row: 2, column: 1 }, 1, 0);
+
+        state.insert_row().unwrap();
+
+        let doc = state.document.as_ref().unwrap();
+        assert_eq!(doc.row_count(), 4);
+        assert_eq!(doc.cell(0, 0).unwrap(), "Ada");
+        assert_eq!(doc.cell(1, 0).unwrap(), "Grace");
+        assert_eq!(doc.cell(2, 0).unwrap(), "");
+        assert_eq!(doc.cell(3, 0).unwrap(), "Alan");
+    }
+
+    #[test]
+    fn find_matches_searches_visible_cells_case_insensitively() {
+        let state = state_with_sample();
+
+        assert_eq!(
+            state.find_matches("a"),
+            vec![
+                Cell { row: 0, column: 0 },
+                Cell { row: 1, column: 0 },
+                Cell { row: 2, column: 0 },
+            ]
+        );
+        assert_eq!(state.find_matches("85"), vec![Cell { row: 1, column: 1 }]);
+        assert!(state.find_matches("").is_empty());
     }
 }

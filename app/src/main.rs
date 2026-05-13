@@ -17,10 +17,12 @@ use objc2_app_kit::{
     NSColor, NSControl, NSControlStateValueOff, NSControlStateValueOn,
     NSControlTextEditingDelegate, NSEvent, NSEventModifierFlags, NSFont, NSImage,
     NSImageNameApplicationIcon, NSImageScaling, NSMenu, NSMenuItem, NSModalResponseCancel,
-    NSModalResponseOK, NSOpenPanel, NSPopUpButton, NSSavePanel, NSScrollView, NSTableColumn,
-    NSTableView, NSTableViewColumnAutoresizingStyle, NSTableViewDataSource, NSTableViewDelegate,
-    NSTableViewGridLineStyle, NSTableViewSelectionHighlightStyle, NSTextAlignment, NSTextField,
-    NSTextFieldCell, NSTextView, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
+    NSModalResponseOK, NSOpenPanel, NSPasteboard, NSPasteboardTypeString,
+    NSPasteboardTypeTabularText, NSPopUpButton, NSProgressIndicator, NSProgressIndicatorStyle,
+    NSSavePanel, NSScrollView, NSTableColumn, NSTableView, NSTableViewColumnAutoresizingStyle,
+    NSTableViewDataSource, NSTableViewDelegate, NSTableViewGridLineStyle,
+    NSTableViewSelectionHighlightStyle, NSTextAlignment, NSTextField, NSTextFieldCell,
+    NSTextFieldDelegate, NSTextView, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{
     MainThreadMarker, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRange, NSRect, NSSize,
@@ -44,11 +46,15 @@ const STATUS_CONTROL_HEIGHT: f64 = 24.0;
 const STATUS_SEPARATOR_HEIGHT: f64 = 1.0;
 const STATUS_SIDE_PADDING: f64 = 12.0;
 const STATUS_LABEL_GAP: f64 = 12.0;
+const FIND_WINDOW_WIDTH: f64 = 540.0;
+const FIND_WINDOW_HEIGHT: f64 = 112.0;
 const MAX_VISIBLE_COLUMNS: usize = 1_024;
 const ROW_NUMBER_COLUMN: &str = "__row_number__";
 const APPLE_ACCENT_COLOR_KEY: &str = "AppleAccentColor";
 const KEY_RETURN: u16 = 36;
 const KEY_KEYPAD_ENTER: u16 = 76;
+const KEY_BACKSPACE: u16 = 51;
+const KEY_FORWARD_DELETE: u16 = 117;
 const KEY_LEFT_ARROW: u16 = 123;
 const KEY_RIGHT_ARROW: u16 = 124;
 const KEY_DOWN_ARROW: u16 = 125;
@@ -60,6 +66,8 @@ enum ToolbarIcon {
     SortFilter,
     Undo,
     Redo,
+    Copy,
+    Find,
     AddRow,
     AddColumn,
     DeleteSelection,
@@ -80,6 +88,8 @@ impl ToolbarIcon {
             ],
             Self::Undo => &["arrow.uturn.backward", "gobackward"],
             Self::Redo => &["arrow.uturn.forward", "goforward"],
+            Self::Copy => &["doc.on.doc", "doc"],
+            Self::Find => &["magnifyingglass"],
             Self::AddRow => &["plus.rectangle.on.rectangle", "plus.rectangle", "plus"],
             Self::AddColumn => &["plus.square.on.square", "plus.square", "plus"],
             Self::DeleteSelection => &["xmark.square", "trash", "minus.square"],
@@ -97,6 +107,8 @@ impl ToolbarIcon {
             Self::SortFilter => "sort and filter",
             Self::Undo => "undo",
             Self::Redo => "redo",
+            Self::Copy => "copy",
+            Self::Find => "find",
             Self::AddRow => "add row",
             Self::AddColumn => "add column",
             Self::DeleteSelection => "delete selection",
@@ -210,6 +222,14 @@ struct FormattingPanel {
     error_label: Retained<NSTextField>,
 }
 
+struct FindPanel {
+    window: Retained<NSWindow>,
+    field: Retained<NSTextField>,
+    status: Retained<NSTextField>,
+    previous: Retained<NSButton>,
+    next: Retained<NSButton>,
+}
+
 #[derive(Default)]
 struct AppDelegateIvars {
     window: OnceCell<Retained<NSWindow>>,
@@ -217,6 +237,9 @@ struct AppDelegateIvars {
     table: OnceCell<Retained<EditableTableView>>,
     toolbar: OnceCell<Retained<NSView>>,
     scroll: OnceCell<Retained<NSScrollView>>,
+    saving_overlay: OnceCell<Retained<NSBox>>,
+    saving_progress: OnceCell<Retained<NSProgressIndicator>>,
+    saving_label: OnceCell<Retained<NSTextField>>,
     status_bar: OnceCell<Retained<NSBox>>,
     status_separator: OnceCell<Retained<NSBox>>,
     status: OnceCell<Retained<NSTextField>>,
@@ -224,7 +247,12 @@ struct AppDelegateIvars {
     selected_selection_metric: RefCell<SelectionMetric>,
     sort_filter_panel: RefCell<Option<SortFilterPanel>>,
     formatting_panel: RefCell<Option<FormattingPanel>>,
+    find_panel: RefCell<Option<FindPanel>>,
+    find_query: RefCell<String>,
+    find_matches: RefCell<Vec<Cell>>,
+    find_index: RefCell<Option<usize>>,
     drag_selection: RefCell<Option<DragSelection>>,
+    is_saving: RefCell<bool>,
     state: RefCell<EditableState>,
 }
 
@@ -243,14 +271,30 @@ define_class!(
     // SAFETY: The text-editing delegate is used to turn field-editor arrow
     // commands back into table navigation while a cell is being edited.
     unsafe impl NSControlTextEditingDelegate for Delegate {
+        #[unsafe(method(controlTextDidChange:))]
+        fn control_text_did_change(&self, notification: &NSNotification) {
+            let Some(field) = notification
+                .object()
+                .and_then(|object| object.downcast::<NSTextField>().ok())
+            else {
+                return;
+            };
+            if self.find_field_matches(&field) {
+                self.update_find_query_from_field(&field);
+            }
+        }
+
         #[unsafe(method(control:textView:doCommandBySelector:))]
         #[allow(non_snake_case)]
         unsafe fn control_textView_doCommandBySelector(
             &self,
-            _control: &NSControl,
+            control: &NSControl,
             text_view: &NSTextView,
             command_selector: Sel,
         ) -> Bool {
+            if self.find_field_matches_control(control) {
+                return false.into();
+            }
             let Some((rows, columns, selector_extending)) =
                 navigation_delta_for_selector(command_selector)
             else {
@@ -262,6 +306,8 @@ define_class!(
             true.into()
         }
     }
+
+    unsafe impl NSTextFieldDelegate for Delegate {}
 
     // SAFETY: NSApplicationDelegate method signatures match AppKit.
     unsafe impl NSApplicationDelegate for Delegate {
@@ -369,6 +415,9 @@ define_class!(
             table_column: Option<&NSTableColumn>,
             row: NSInteger,
         ) {
+            if self.is_saving() {
+                return;
+            }
             let Some(VisibleColumn::Data(column)) =
                 table_column.and_then(visible_column_from_table_column)
             else {
@@ -438,11 +487,15 @@ define_class!(
             _table_view: &NSTableView,
             table_column: Option<&NSTableColumn>,
             _row: NSInteger,
-        ) -> bool {
+        ) -> Bool {
+            if self.is_saving() {
+                return false.into();
+            }
             matches!(
                 table_column.and_then(visible_column_from_table_column),
                 Some(VisibleColumn::Data(_))
             )
+            .into()
         }
 
         #[unsafe(method(tableView:willDisplayCell:forTableColumn:row:))]
@@ -474,7 +527,19 @@ define_class!(
                 _ => false,
             };
 
-            apply_table_cell_style(text_cell, visible_column, selected, active);
+            let (find_match, find_active) = match visible_column {
+                Some(VisibleColumn::Data(column)) => self.find_cell_state(Cell { row, column }),
+                _ => (false, false),
+            };
+
+            apply_table_cell_style(
+                text_cell,
+                visible_column,
+                selected,
+                active,
+                find_match,
+                find_active,
+            );
         }
     }
 
@@ -501,14 +566,26 @@ define_class!(
         }
 
         #[unsafe(method(windowWillClose:))]
-        fn window_will_close(&self, _notification: &NSNotification) {
+        fn window_will_close(&self, notification: &NSNotification) {
+            if notification
+                .object()
+                .and_then(|object| object.downcast::<NSWindow>().ok())
+                .is_some_and(|window| self.find_window_matches(&window))
+            {
+                self.clear_find_matches();
+                self.ivars().find_panel.replace(None);
+                return;
+            }
             self.ivars().sort_filter_panel.replace(None);
             self.ivars().formatting_panel.replace(None);
+            self.clear_find_matches();
+            self.ivars().find_panel.replace(None);
         }
 
         #[unsafe(method(windowDidResize:))]
         fn window_did_resize(&self, _notification: &NSNotification) {
             self.layout_main_views();
+            self.recenter_find_panel();
         }
     }
 
@@ -547,6 +624,18 @@ define_class!(
         #[unsafe(method(menuRedoChange:))]
         fn menu_redo_change(&self, sender: &AnyObject) {
             self.with_active_window_delegate(|delegate| delegate.redo_change(sel!(redoChange:), sender));
+        }
+
+        #[unsafe(method(menuCopySelection:))]
+        fn menu_copy_selection(&self, sender: &AnyObject) {
+            self.with_active_window_delegate(|delegate| {
+                delegate.copy_selection(sel!(copySelection:), sender)
+            });
+        }
+
+        #[unsafe(method(menuFind:))]
+        fn menu_find(&self, sender: &AnyObject) {
+            self.with_active_window_delegate(|delegate| delegate.open_find(sel!(openFind:), sender));
         }
 
         #[unsafe(method(menuToggleHeader:))]
@@ -637,6 +726,9 @@ define_class!(
 
         #[unsafe(method(toggleHeader:))]
         fn toggle_header(&self, sender: &AnyObject) {
+            if self.is_saving() {
+                return;
+            }
             let checked = sender
                 .downcast_ref::<NSButton>()
                 .map(|button| button.state() == NSControlStateValueOn)
@@ -894,6 +986,9 @@ define_class!(
 
         #[unsafe(method(sortAscending:))]
         fn sort_ascending(&self, _sender: &AnyObject) {
+            if self.is_saving() {
+                return;
+            }
             let result = self
                 .ivars()
                 .state
@@ -905,6 +1000,9 @@ define_class!(
 
         #[unsafe(method(undoChange:))]
         fn undo_change(&self, _sender: &AnyObject) {
+            if self.is_saving() {
+                return;
+            }
             if self.ivars().state.borrow_mut().undo() {
                 self.rebuild_columns();
                 self.refresh_table();
@@ -915,6 +1013,9 @@ define_class!(
 
         #[unsafe(method(redoChange:))]
         fn redo_change(&self, _sender: &AnyObject) {
+            if self.is_saving() {
+                return;
+            }
             if self.ivars().state.borrow_mut().redo() {
                 self.rebuild_columns();
                 self.refresh_table();
@@ -923,8 +1024,31 @@ define_class!(
             }
         }
 
+        #[unsafe(method(copySelection:))]
+        fn copy_selection(&self, _sender: &AnyObject) {
+            self.copy_selection_to_pasteboard();
+        }
+
+        #[unsafe(method(openFind:))]
+        fn open_find(&self, _sender: &AnyObject) {
+            self.present_find_panel();
+        }
+
+        #[unsafe(method(findPrevious:))]
+        fn find_previous(&self, _sender: &AnyObject) {
+            self.step_find_match(-1);
+        }
+
+        #[unsafe(method(findNext:))]
+        fn find_next(&self, _sender: &AnyObject) {
+            self.step_find_match(1);
+        }
+
         #[unsafe(method(sortDescending:))]
         fn sort_descending(&self, _sender: &AnyObject) {
+            if self.is_saving() {
+                return;
+            }
             let result = self
                 .ivars()
                 .state
@@ -936,6 +1060,9 @@ define_class!(
 
         #[unsafe(method(addRow:))]
         fn add_row(&self, _sender: &AnyObject) {
+            if self.is_saving() {
+                return;
+            }
             let result = self.ivars().state.borrow_mut().insert_row();
             self.handle_result(result);
             self.refresh_table();
@@ -943,6 +1070,9 @@ define_class!(
 
         #[unsafe(method(addColumn:))]
         fn add_column(&self, _sender: &AnyObject) {
+            if self.is_saving() {
+                return;
+            }
             let result = self.ivars().state.borrow_mut().insert_column();
             self.handle_result(result);
             self.rebuild_columns();
@@ -951,6 +1081,9 @@ define_class!(
 
         #[unsafe(method(deleteSelection:))]
         fn delete_selection(&self, _sender: &AnyObject) {
+            if self.is_saving() {
+                return;
+            }
             let result = self.ivars().state.borrow_mut().delete_selection();
             self.handle_result(result);
             self.rebuild_columns();
@@ -959,6 +1092,9 @@ define_class!(
 
         #[unsafe(method(rowUp:))]
         fn row_up(&self, _sender: &AnyObject) {
+            if self.is_saving() {
+                return;
+            }
             let result = self.ivars().state.borrow_mut().move_active_row(-1);
             self.handle_result(result);
             self.refresh_table();
@@ -967,6 +1103,9 @@ define_class!(
 
         #[unsafe(method(rowDown:))]
         fn row_down(&self, _sender: &AnyObject) {
+            if self.is_saving() {
+                return;
+            }
             let result = self.ivars().state.borrow_mut().move_active_row(1);
             self.handle_result(result);
             self.refresh_table();
@@ -975,6 +1114,9 @@ define_class!(
 
         #[unsafe(method(columnLeft:))]
         fn column_left(&self, _sender: &AnyObject) {
+            if self.is_saving() {
+                return;
+            }
             let result = self.ivars().state.borrow_mut().move_active_column(-1);
             self.handle_result(result);
             self.rebuild_columns();
@@ -984,6 +1126,9 @@ define_class!(
 
         #[unsafe(method(columnRight:))]
         fn column_right(&self, _sender: &AnyObject) {
+            if self.is_saving() {
+                return;
+            }
             let result = self.ivars().state.borrow_mut().move_active_column(1);
             self.handle_result(result);
             self.rebuild_columns();
@@ -993,11 +1138,17 @@ define_class!(
 
         #[unsafe(method(saveDocument:))]
         fn save_document(&self, _sender: &AnyObject) {
+            if self.is_saving() {
+                return;
+            }
             self.save_document_with_prompt();
         }
 
         #[unsafe(method(editClickedCell:))]
         fn edit_clicked_cell(&self, _sender: &AnyObject) {
+            if self.is_saving() {
+                return;
+            }
             let Some(table) = self.ivars().table.get() else {
                 return;
             };
@@ -1023,6 +1174,9 @@ define_class!(
 
         #[unsafe(method(editSelectedCell:))]
         fn edit_selected_cell(&self, _sender: &AnyObject) {
+            if self.is_saving() {
+                return;
+            }
             self.edit_top_left_selected_cell(None);
         }
     }
@@ -1067,12 +1221,14 @@ impl Delegate {
         let status = self.make_status(mtm);
         let selection_status = self.make_selection_status(mtm);
         let scroll = self.make_table_area(mtm);
+        let saving_overlay = self.make_saving_overlay(mtm);
         content.addSubview(&toolbar);
         content.addSubview(&scroll);
         content.addSubview(&status_bar);
         content.addSubview(&status_separator);
         content.addSubview(&status);
         content.addSubview(&selection_status);
+        content.addSubview(&saving_overlay);
 
         window.center();
         window.setDelegate(Some(ProtocolObject::from_ref(self)));
@@ -1116,6 +1272,12 @@ impl Delegate {
     }
 
     fn save_document_with_prompt(&self) -> bool {
+        if self.is_saving() {
+            return false;
+        }
+        if let Some(window) = self.ivars().window.get() {
+            unsafe { window.endEditingFor(None) };
+        }
         let target = {
             let state = self.ivars().state.borrow();
             let Some(doc) = state.document.as_ref() else {
@@ -1131,8 +1293,10 @@ impl Delegate {
             }
         };
 
+        self.set_saving(true);
         let result = self.ivars().state.borrow_mut().save(target);
         let ok = result.is_ok();
+        self.set_saving(false);
         self.handle_result(result);
         self.refresh_table();
         ok
@@ -1304,6 +1468,22 @@ impl Delegate {
             mtm,
         ));
         edit_menu.addItem(&menu_item(
+            "Copy",
+            delegate_target,
+            Some(sel!(menuCopySelection:)),
+            "c",
+            NSEventModifierFlags::Command,
+            mtm,
+        ));
+        edit_menu.addItem(&menu_item(
+            "Find",
+            delegate_target,
+            Some(sel!(menuFind:)),
+            "f",
+            NSEventModifierFlags::Command,
+            mtm,
+        ));
+        edit_menu.addItem(&menu_item(
             "Delete Selection",
             delegate_target,
             Some(sel!(menuDeleteSelection:)),
@@ -1450,44 +1630,46 @@ impl Delegate {
             ),
             (ToolbarIcon::Undo, "Undo", sel!(undoChange:), 248.0, 72.0),
             (ToolbarIcon::Redo, "Redo", sel!(redoChange:), 324.0, 72.0),
-            (ToolbarIcon::AddRow, "Add Row", sel!(addRow:), 408.0, 82.0),
+            (ToolbarIcon::Copy, "Copy", sel!(copySelection:), 408.0, 72.0),
+            (ToolbarIcon::Find, "Find", sel!(openFind:), 484.0, 72.0),
+            (ToolbarIcon::AddRow, "Add Row", sel!(addRow:), 560.0, 82.0),
             (
                 ToolbarIcon::AddColumn,
                 "Add Col",
                 sel!(addColumn:),
-                494.0,
+                646.0,
                 82.0,
             ),
             (
                 ToolbarIcon::DeleteSelection,
                 "Delete",
                 sel!(deleteSelection:),
-                580.0,
+                732.0,
                 82.0,
             ),
-            (ToolbarIcon::MoveRowUp, "Row Up", sel!(rowUp:), 674.0, 80.0),
+            (ToolbarIcon::MoveRowUp, "Row Up", sel!(rowUp:), 826.0, 80.0),
             (
                 ToolbarIcon::MoveRowDown,
                 "Row Down",
                 sel!(rowDown:),
-                758.0,
+                910.0,
                 94.0,
             ),
             (
                 ToolbarIcon::MoveColumnLeft,
                 "Col Left",
                 sel!(columnLeft:),
-                864.0,
+                1016.0,
                 84.0,
             ),
             (
                 ToolbarIcon::MoveColumnRight,
                 "Col Right",
                 sel!(columnRight:),
-                952.0,
+                1104.0,
                 96.0,
             ),
-            (ToolbarIcon::Save, "Save", sel!(saveDocument:), 1058.0, 62.0),
+            (ToolbarIcon::Save, "Save", sel!(saveDocument:), 1210.0, 62.0),
         ];
         for (icon, title, action, x, width) in controls {
             toolbar.addSubview(&toolbar_button(
@@ -1625,6 +1807,174 @@ impl Delegate {
         self.ivars().table.set(table).ok();
         self.ivars().scroll.set(scroll.clone()).ok();
         scroll
+    }
+
+    fn make_saving_overlay(&self, mtm: MainThreadMarker) -> Retained<NSBox> {
+        let overlay = NSBox::initWithFrame(
+            NSBox::alloc(mtm),
+            NSRect::new(NSPoint::new(0.0, STATUS_HEIGHT), NSSize::new(1120.0, 640.0)),
+        );
+        overlay.setBoxType(NSBoxType::Custom);
+        overlay.setTitle(&NSString::from_str(""));
+        overlay.setTransparent(false);
+        overlay.setBorderWidth(0.0);
+        overlay.setFillColor(&NSColor::windowBackgroundColor().colorWithAlphaComponent(0.82));
+        overlay.setHidden(true);
+        overlay.setAutoresizingMask(
+            NSAutoresizingMaskOptions::ViewWidthSizable
+                | NSAutoresizingMaskOptions::ViewHeightSizable,
+        );
+
+        let progress = NSProgressIndicator::initWithFrame(
+            NSProgressIndicator::alloc(mtm),
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(32.0, 32.0)),
+        );
+        progress.setStyle(NSProgressIndicatorStyle::Spinning);
+        progress.setIndeterminate(true);
+        progress.setDisplayedWhenStopped(false);
+        progress.sizeToFit();
+
+        let label = NSTextField::labelWithString(&NSString::from_str("Saving..."), mtm);
+        label.setFont(Some(&NSFont::systemFontOfSize(13.0)));
+        label.setTextColor(Some(&NSColor::secondaryLabelColor()));
+        label.setAlignment(NSTextAlignment::Center);
+
+        overlay.addSubview(&progress);
+        overlay.addSubview(&label);
+        self.ivars().saving_progress.set(progress).ok();
+        self.ivars().saving_label.set(label).ok();
+        self.ivars().saving_overlay.set(overlay.clone()).ok();
+        overlay
+    }
+
+    fn present_find_panel(&self) {
+        if self.ivars().find_panel.borrow().is_none() {
+            let panel = self.build_find_panel();
+            self.ivars().find_panel.replace(Some(panel));
+        }
+
+        let Some(panel) = self.ivars().find_panel.borrow().as_ref().map(|panel| {
+            (
+                panel.window.clone(),
+                panel.field.clone(),
+                panel.previous.clone(),
+                panel.next.clone(),
+            )
+        }) else {
+            return;
+        };
+        let (window, field, previous, next) = panel;
+        self.position_find_window(&window);
+        previous.setEnabled(!self.ivars().find_matches.borrow().is_empty());
+        next.setEnabled(!self.ivars().find_matches.borrow().is_empty());
+        window.makeKeyAndOrderFront(None);
+        unsafe {
+            let _: bool = msg_send![&*window, makeFirstResponder: &*field];
+            field.selectText(None);
+        }
+        self.recompute_find_matches(true);
+    }
+
+    fn build_find_panel(&self) -> FindPanel {
+        let mtm = self.mtm();
+        let target = unsafe { any_ref(self) };
+        let window = unsafe {
+            NSWindow::initWithContentRect_styleMask_backing_defer(
+                NSWindow::alloc(mtm),
+                NSRect::new(
+                    NSPoint::new(0.0, 0.0),
+                    NSSize::new(FIND_WINDOW_WIDTH, FIND_WINDOW_HEIGHT),
+                ),
+                NSWindowStyleMask::Titled | NSWindowStyleMask::Closable,
+                NSBackingStoreType::Buffered,
+                false,
+            )
+        };
+        unsafe { window.setReleasedWhenClosed(false) };
+        window.setTitle(&NSString::from_str("Find"));
+        window.setRestorable(false);
+        window.setDelegate(Some(ProtocolObject::from_ref(self)));
+
+        let content = NSView::initWithFrame(
+            NSView::alloc(mtm),
+            NSRect::new(
+                NSPoint::new(0.0, 0.0),
+                NSSize::new(FIND_WINDOW_WIDTH, FIND_WINDOW_HEIGHT),
+            ),
+        );
+
+        let field = NSTextField::textFieldWithString(
+            &NSString::from_str(&self.ivars().find_query.borrow()),
+            mtm,
+        );
+        field.setFrame(NSRect::new(
+            NSPoint::new(18.0, 38.0),
+            NSSize::new(378.0, 28.0),
+        ));
+        field.setPlaceholderString(Some(&NSString::from_str("Find")));
+        field.setFont(Some(&NSFont::systemFontOfSize(14.0)));
+        unsafe {
+            field.setDelegate(Some(ProtocolObject::from_ref(self)));
+            field.setTarget(Some(target));
+            field.setAction(Some(sel!(findNext:)));
+        }
+
+        let status = NSTextField::labelWithString(&NSString::from_str("No query"), mtm);
+        status.setFrame(NSRect::new(
+            NSPoint::new(20.0, 14.0),
+            NSSize::new(376.0, 20.0),
+        ));
+        status.setFont(Some(&NSFont::systemFontOfSize(12.0)));
+        status.setTextColor(Some(&NSColor::secondaryLabelColor()));
+
+        let previous = button("<", target, sel!(findPrevious:), mtm, 412.0, 41.0, 46.0);
+        previous.setToolTip(Some(&NSString::from_str("Previous match")));
+        let next = button(">", target, sel!(findNext:), mtm, 468.0, 41.0, 46.0);
+        next.setToolTip(Some(&NSString::from_str("Next match")));
+        previous.setEnabled(false);
+        next.setEnabled(false);
+
+        content.addSubview(&field);
+        content.addSubview(&status);
+        content.addSubview(&previous);
+        content.addSubview(&next);
+        window.setContentView(Some(&content));
+
+        FindPanel {
+            window,
+            field,
+            status,
+            previous,
+            next,
+        }
+    }
+
+    fn position_find_window(&self, find_window: &NSWindow) {
+        let Some(window) = self.ivars().window.get() else {
+            find_window.center();
+            return;
+        };
+        let parent = window.frame();
+        let origin = NSPoint::new(
+            parent.origin.x + (parent.size.width - FIND_WINDOW_WIDTH) / 2.0,
+            parent.origin.y + (parent.size.height - FIND_WINDOW_HEIGHT) / 2.0,
+        );
+        find_window.setFrame_display(
+            NSRect::new(origin, NSSize::new(FIND_WINDOW_WIDTH, FIND_WINDOW_HEIGHT)),
+            true,
+        );
+    }
+
+    fn recenter_find_panel(&self) {
+        if let Some(window) = self
+            .ivars()
+            .find_panel
+            .borrow()
+            .as_ref()
+            .map(|panel| panel.window.clone())
+        {
+            self.position_find_window(&window);
+        }
     }
 
     fn present_formatting_panel(&self) {
@@ -2149,6 +2499,7 @@ impl Delegate {
     }
 
     fn refresh_table(&self) {
+        self.recompute_find_matches(false);
         if let Some(table) = self.ivars().table.get() {
             table.reloadData();
         }
@@ -2228,6 +2579,15 @@ impl Delegate {
             ));
         }
 
+        if let Some(overlay) = self.ivars().saving_overlay.get() {
+            let overlay_height = (height - STATUS_HEIGHT - toolbar_height).max(0.0);
+            overlay.setFrame(NSRect::new(
+                NSPoint::new(0.0, STATUS_HEIGHT),
+                NSSize::new(width, overlay_height),
+            ));
+            self.layout_saving_overlay(width, overlay_height);
+        }
+
         if let Some(status_bar) = self.ivars().status_bar.get() {
             status_bar.setFrame(NSRect::new(
                 NSPoint::new(0.0, 0.0),
@@ -2243,6 +2603,25 @@ impl Delegate {
         }
 
         self.layout_status_labels();
+    }
+
+    fn layout_saving_overlay(&self, width: f64, height: f64) {
+        let center_x = width / 2.0;
+        let center_y = height / 2.0;
+        if let Some(progress) = self.ivars().saving_progress.get() {
+            let size = progress.frame().size;
+            progress.setFrame(NSRect::new(
+                NSPoint::new(center_x - size.width / 2.0, center_y + 8.0),
+                size,
+            ));
+        }
+        if let Some(label) = self.ivars().saving_label.get() {
+            let label_width = 160.0_f64.min(width.max(0.0));
+            label.setFrame(NSRect::new(
+                NSPoint::new(center_x - label_width / 2.0, center_y - 26.0),
+                NSSize::new(label_width, 20.0),
+            ));
+        }
     }
 
     fn layout_toolbar(&self, width: f64) -> f64 {
@@ -2316,12 +2695,244 @@ impl Delegate {
         }
     }
 
+    fn is_saving(&self) -> bool {
+        *self.ivars().is_saving.borrow()
+    }
+
+    fn set_saving(&self, saving: bool) {
+        self.ivars().is_saving.replace(saving);
+        self.update_saving_ui();
+        if let Some(window) = self.ivars().window.get() {
+            window.displayIfNeeded();
+        }
+    }
+
+    fn update_saving_ui(&self) {
+        let saving = self.is_saving();
+        if let Some(overlay) = self.ivars().saving_overlay.get() {
+            overlay.setHidden(!saving);
+        }
+        if let Some(progress) = self.ivars().saving_progress.get() {
+            unsafe {
+                if saving {
+                    progress.startAnimation(None);
+                } else {
+                    progress.stopAnimation(None);
+                }
+            }
+        }
+        if let Some(toolbar) = self.ivars().toolbar.get() {
+            let subviews = toolbar.subviews();
+            for idx in 0..subviews.count() {
+                if let Some(control) = subviews.objectAtIndex(idx).downcast_ref::<NSControl>() {
+                    control.setEnabled(!saving);
+                }
+            }
+        }
+        if let Some(table) = self.ivars().table.get() {
+            table.setAllowsColumnReordering(!saving);
+        }
+    }
+
     fn navigate_selection(&self, rows: isize, columns: isize, extending: bool) {
         self.ivars()
             .state
             .borrow_mut()
             .move_selection(rows, columns, extending);
         self.refresh_table();
+    }
+
+    fn copy_selection_to_pasteboard(&self) -> bool {
+        let Some(text) = self.ivars().state.borrow().selected_text() else {
+            return false;
+        };
+        let pasteboard = NSPasteboard::generalPasteboard();
+        pasteboard.clearContents();
+        let text = NSString::from_str(&text);
+        unsafe {
+            pasteboard.setString_forType(&text, NSPasteboardTypeString);
+            pasteboard.setString_forType(&text, NSPasteboardTypeTabularText);
+        }
+        true
+    }
+
+    fn update_find_query_from_field(&self, field: &NSTextField) {
+        self.ivars()
+            .find_query
+            .replace(field.stringValue().to_string());
+        self.recompute_find_matches(true);
+    }
+
+    fn recompute_find_matches(&self, activate: bool) {
+        if self.ivars().find_panel.borrow().is_none() {
+            return;
+        }
+
+        let query = self.ivars().find_query.borrow().clone();
+        let matches = self.ivars().state.borrow().find_matches(&query);
+        let previous_active = self
+            .ivars()
+            .find_index
+            .borrow()
+            .and_then(|index| self.ivars().find_matches.borrow().get(index).copied());
+        let next_index = previous_active
+            .and_then(|cell| matches.iter().position(|match_cell| *match_cell == cell))
+            .or_else(|| (!matches.is_empty()).then_some(0));
+
+        self.ivars().find_matches.replace(matches);
+        self.ivars().find_index.replace(next_index);
+        self.update_find_buttons();
+
+        if activate {
+            if next_index.is_some() {
+                self.activate_current_find_match();
+            } else if let Some(table) = self.ivars().table.get() {
+                table.reloadData();
+            }
+        }
+    }
+
+    fn update_find_buttons(&self) {
+        let enabled = !self.ivars().find_matches.borrow().is_empty();
+        if let Some(panel) = self.ivars().find_panel.borrow().as_ref() {
+            panel.previous.setEnabled(enabled);
+            panel.next.setEnabled(enabled);
+            panel
+                .status
+                .setStringValue(&NSString::from_str(&self.find_status_text()));
+        }
+    }
+
+    fn clear_find_matches(&self) {
+        self.ivars().find_matches.borrow_mut().clear();
+        self.ivars().find_index.replace(None);
+        if let Some(table) = self.ivars().table.get() {
+            table.reloadData();
+        }
+    }
+
+    fn find_status_text(&self) -> String {
+        let query_is_empty = self.ivars().find_query.borrow().trim().is_empty();
+        if query_is_empty {
+            return "No query".to_string();
+        }
+
+        let count = self.ivars().find_matches.borrow().len();
+        if count == 0 {
+            return "No matches".to_string();
+        }
+
+        let current = self.ivars().find_index.borrow().unwrap_or(0) + 1;
+        format!("{current} of {count} matches")
+    }
+
+    fn step_find_match(&self, delta: isize) {
+        if self.ivars().find_panel.borrow().is_none() {
+            self.present_find_panel();
+            return;
+        }
+
+        if let Some(field) = self
+            .ivars()
+            .find_panel
+            .borrow()
+            .as_ref()
+            .map(|panel| panel.field.clone())
+        {
+            self.ivars()
+                .find_query
+                .replace(field.stringValue().to_string());
+            self.recompute_find_matches(false);
+        }
+
+        let len = self.ivars().find_matches.borrow().len();
+        if len == 0 {
+            self.ivars().find_index.replace(None);
+            self.update_find_buttons();
+            if let Some(table) = self.ivars().table.get() {
+                table.reloadData();
+            }
+            return;
+        }
+
+        let current = self.ivars().find_index.borrow().unwrap_or_else(|| {
+            if delta < 0 {
+                0
+            } else {
+                len.saturating_sub(1)
+            }
+        });
+        let next = if delta < 0 {
+            (current + len - 1) % len
+        } else {
+            (current + 1) % len
+        };
+        self.ivars().find_index.replace(Some(next));
+        self.activate_current_find_match();
+    }
+
+    fn activate_current_find_match(&self) {
+        let Some(cell) = self
+            .ivars()
+            .find_index
+            .borrow()
+            .and_then(|index| self.ivars().find_matches.borrow().get(index).copied())
+        else {
+            return;
+        };
+        self.ivars()
+            .state
+            .borrow_mut()
+            .select_cell(cell.row, cell.column);
+        self.refresh_table();
+    }
+
+    fn find_cell_state(&self, cell: Cell) -> (bool, bool) {
+        let matches = self.ivars().find_matches.borrow();
+        let Some(index) = matches.iter().position(|match_cell| *match_cell == cell) else {
+            return (false, false);
+        };
+        let active = self
+            .ivars()
+            .find_index
+            .borrow()
+            .is_some_and(|active| active == index);
+        (true, active)
+    }
+
+    fn find_field_matches(&self, field: &NSTextField) -> bool {
+        self.ivars()
+            .find_panel
+            .borrow()
+            .as_ref()
+            .is_some_and(|panel| {
+                let panel_field = &*panel.field as *const NSTextField as *const ();
+                let field = field as *const NSTextField as *const ();
+                ptr::eq(panel_field, field)
+            })
+    }
+
+    fn find_field_matches_control(&self, control: &NSControl) -> bool {
+        self.ivars()
+            .find_panel
+            .borrow()
+            .as_ref()
+            .is_some_and(|panel| {
+                let panel_field = &*panel.field as *const NSTextField as *const ();
+                let control = control as *const NSControl as *const ();
+                ptr::eq(panel_field, control)
+            })
+    }
+
+    fn find_window_matches(&self, window: &NSWindow) -> bool {
+        self.ivars()
+            .find_panel
+            .borrow()
+            .as_ref()
+            .is_some_and(|panel| {
+                let panel_window = &*panel.window as *const NSWindow;
+                ptr::eq(panel_window, window)
+            })
     }
 
     fn edit_top_left_selected_cell(&self, initial_text: Option<&str>) -> bool {
@@ -2365,6 +2976,9 @@ impl Delegate {
     }
 
     fn table_mouse_down(&self, table: &EditableTableView, event: &NSEvent) {
+        if self.is_saving() {
+            return;
+        }
         let Some(hit) = table_hit(table, event) else {
             return;
         };
@@ -2441,6 +3055,9 @@ impl Delegate {
     }
 
     fn table_mouse_dragged(&self, table: &EditableTableView, event: &NSEvent) {
+        if self.is_saving() {
+            return;
+        }
         let Some(hit) = table_hit(table, event) else {
             return;
         };
@@ -2497,11 +3114,26 @@ impl Delegate {
     }
 
     fn table_key_down(&self, event: &NSEvent) -> bool {
+        if self.is_saving() {
+            return true;
+        }
         let modifiers = event.modifierFlags();
         let characters = event
             .charactersIgnoringModifiers()
             .map(|value| value.to_string())
             .unwrap_or_default();
+
+        if modifiers.contains(NSEventModifierFlags::Command) && characters.eq_ignore_ascii_case("c")
+        {
+            self.copy_selection_to_pasteboard();
+            return true;
+        }
+
+        if modifiers.contains(NSEventModifierFlags::Command) && characters.eq_ignore_ascii_case("f")
+        {
+            self.present_find_panel();
+            return true;
+        }
 
         if modifiers.contains(NSEventModifierFlags::Command) && characters.eq_ignore_ascii_case("z")
         {
@@ -2514,6 +3146,19 @@ impl Delegate {
                 self.rebuild_columns();
                 self.refresh_table();
             }
+            return true;
+        }
+
+        if matches!(event.keyCode(), KEY_BACKSPACE | KEY_FORWARD_DELETE)
+            && !modifiers.intersects(
+                NSEventModifierFlags::Command
+                    | NSEventModifierFlags::Control
+                    | NSEventModifierFlags::Option,
+            )
+        {
+            let result = self.ivars().state.borrow_mut().clear_selection_content();
+            self.handle_result(result);
+            self.refresh_table();
             return true;
         }
 
@@ -2652,12 +3297,22 @@ fn apply_table_cell_style(
     visible_column: Option<VisibleColumn>,
     selected: bool,
     active: bool,
+    find_match: bool,
+    find_active: bool,
 ) {
     cell.setFont(Some(&table_data_font()));
 
-    if selected {
+    if find_active {
+        cell.setDrawsBackground(true);
+        cell.setBackgroundColor(Some(&find_active_background()));
+        cell.setTextColor(Some(&NSColor::labelColor()));
+    } else if selected {
         cell.setDrawsBackground(true);
         cell.setBackgroundColor(Some(&selection_background(active)));
+        cell.setTextColor(Some(&NSColor::labelColor()));
+    } else if find_match {
+        cell.setDrawsBackground(true);
+        cell.setBackgroundColor(Some(&find_match_background()));
         cell.setTextColor(Some(&NSColor::labelColor()));
     } else if matches!(visible_column, Some(VisibleColumn::RowNumber)) {
         cell.setDrawsBackground(true);
@@ -2675,6 +3330,14 @@ fn table_data_font() -> Retained<NSFont> {
 
 fn selection_background(active: bool) -> Retained<NSColor> {
     user_accent_color().colorWithAlphaComponent(if active { 0.34 } else { 0.22 })
+}
+
+fn find_match_background() -> Retained<NSColor> {
+    NSColor::systemYellowColor().colorWithAlphaComponent(0.28)
+}
+
+fn find_active_background() -> Retained<NSColor> {
+    NSColor::systemYellowColor().colorWithAlphaComponent(0.62)
 }
 
 fn user_accent_color() -> Retained<NSColor> {
