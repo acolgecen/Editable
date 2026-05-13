@@ -680,6 +680,11 @@ define_class!(
             self.present_formatting_panel();
         }
 
+        #[unsafe(method(formattingSeparatorChanged:))]
+        fn formatting_separator_changed(&self, _sender: &AnyObject) {
+            self.update_custom_delimiter_visibility();
+        }
+
         #[unsafe(method(addSortRule:))]
         fn add_sort_rule(&self, _sender: &AnyObject) {
             let (mut sorts, filters) = self.collect_sort_filter_draft();
@@ -1559,6 +1564,10 @@ impl Delegate {
             132.0,
             132.0,
         );
+        unsafe {
+            delimiter.setTarget(Some(target));
+            delimiter.setAction(Some(sel!(formattingSeparatorChanged:)));
+        }
         content.addSubview(&delimiter);
 
         let custom_delimiter = NSTextField::textFieldWithString(
@@ -1570,6 +1579,7 @@ impl Delegate {
             NSSize::new(48.0, 24.0),
         ));
         custom_delimiter.setPlaceholderString(Some(&NSString::from_str("x")));
+        custom_delimiter.setHidden(delimiter_index(state.delimiter) != 5);
         content.addSubview(&custom_delimiter);
 
         content.addSubview(&field_label("Thousands", mtm, 24.0, 100.0, 110.0));
@@ -1699,6 +1709,14 @@ impl Delegate {
                 decimal_separator,
             },
         })
+    }
+
+    fn update_custom_delimiter_visibility(&self) {
+        if let Some(panel) = self.ivars().formatting_panel.borrow().as_ref() {
+            panel
+                .custom_delimiter
+                .setHidden(panel.delimiter.indexOfSelectedItem() != 5);
+        }
     }
 
     fn present_sort_filter_panel(&self) {
