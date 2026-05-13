@@ -4,7 +4,7 @@ mod app_state;
 mod selection;
 
 use app_state::EditableState;
-use editable_csv_core::{FilterOperator, FilterRule, SortDirection, SortKey};
+use editable_csv_core::{FilterOperator, FilterRule, NumberFormat, SortDirection, SortKey};
 use objc2::ffi::{NSInteger, NSUInteger};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, Bool, ProtocolObject};
@@ -21,8 +21,8 @@ use objc2_app_kit::{
     NSTextFieldCell, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{
-    MainThreadMarker, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize,
-    NSString, NSUserDefaults,
+    MainThreadMarker, NSLocale, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect,
+    NSSize, NSString, NSUserDefaults,
 };
 use selection::Cell;
 use std::cell::{OnceCell, RefCell};
@@ -129,15 +129,24 @@ struct SortFilterPanel {
     error_label: Retained<NSTextField>,
 }
 
+struct FormattingPanel {
+    header: Retained<NSButton>,
+    skip_rows: Retained<NSTextField>,
+    delimiter: Retained<NSPopUpButton>,
+    custom_delimiter: Retained<NSTextField>,
+    grouping_separator: Retained<NSTextField>,
+    decimal_separator: Retained<NSTextField>,
+    error_label: Retained<NSTextField>,
+}
+
 #[derive(Default)]
 struct AppDelegateIvars {
     window: OnceCell<Retained<NSWindow>>,
     window_delegates: RefCell<Vec<Retained<Delegate>>>,
     table: OnceCell<Retained<EditableTableView>>,
     status: OnceCell<Retained<NSTextField>>,
-    header_checkbox: OnceCell<Retained<NSButton>>,
-    skip_field: OnceCell<Retained<NSTextField>>,
     sort_filter_panel: RefCell<Option<SortFilterPanel>>,
+    formatting_panel: RefCell<Option<FormattingPanel>>,
     drag_selection: RefCell<Option<DragSelection>>,
     state: RefCell<EditableState>,
 }
@@ -386,6 +395,7 @@ define_class!(
         #[unsafe(method(windowWillClose:))]
         fn window_will_close(&self, _notification: &NSNotification) {
             self.ivars().sort_filter_panel.replace(None);
+            self.ivars().formatting_panel.replace(None);
         }
     }
 
@@ -435,6 +445,13 @@ define_class!(
         fn menu_set_skip_rows(&self, sender: &AnyObject) {
             self.with_active_window_delegate(|delegate| {
                 delegate.set_skip_rows_from_menu(sel!(setSkipRowsFromMenu:), sender)
+            });
+        }
+
+        #[unsafe(method(menuOpenFormatting:))]
+        fn menu_open_formatting(&self, sender: &AnyObject) {
+            self.with_active_window_delegate(|delegate| {
+                delegate.open_formatting(sel!(openFormatting:), sender)
             });
         }
 
@@ -517,13 +534,6 @@ define_class!(
                 state.reopen_with_options()
             };
             self.handle_result(result);
-            if let Some(header) = self.ivars().header_checkbox.get() {
-                header.setState(if checked {
-                    NSControlStateValueOn
-                } else {
-                    NSControlStateValueOff
-                });
-            }
             self.rebuild_columns();
             self.refresh_table();
         }
@@ -565,9 +575,6 @@ define_class!(
                 state.reopen_with_options()
             };
             self.handle_result(result);
-            if let Some(skip_field) = self.ivars().skip_field.get() {
-                skip_field.setStringValue(&NSString::from_str(&value.to_string()));
-            }
             self.rebuild_columns();
             self.refresh_table();
         }
@@ -609,6 +616,11 @@ define_class!(
         #[unsafe(method(openSortFilter:))]
         fn open_sort_filter(&self, _sender: &AnyObject) {
             self.present_sort_filter_panel();
+        }
+
+        #[unsafe(method(openFormatting:))]
+        fn open_formatting(&self, _sender: &AnyObject) {
+            self.present_formatting_panel();
         }
 
         #[unsafe(method(addSortRule:))]
@@ -696,6 +708,55 @@ define_class!(
 
         #[unsafe(method(cancelSortFilter:))]
         fn cancel_sort_filter(&self, _sender: &AnyObject) {
+            NSApplication::sharedApplication(self.mtm()).stopModalWithCode(NSModalResponseCancel);
+        }
+
+        #[unsafe(method(doneFormatting:))]
+        fn done_formatting(&self, _sender: &AnyObject) {
+            let Some(options) = self.collect_formatting_draft() else {
+                return;
+            };
+            let previous = {
+                let state = self.ivars().state.borrow();
+                FormattingDraft {
+                    first_row_is_header: state.first_row_is_header,
+                    skip_rows: state.skip_rows,
+                    delimiter: state.delimiter,
+                    number_format: state.number_format,
+                }
+            };
+            let result = {
+                let mut state = self.ivars().state.borrow_mut();
+                state.first_row_is_header = options.first_row_is_header;
+                state.skip_rows = options.skip_rows;
+                state.delimiter = options.delimiter;
+                state.number_format = options.number_format;
+                state.reopen_with_options()
+            };
+            if let Err(err) = result {
+                {
+                    let mut state = self.ivars().state.borrow_mut();
+                    state.first_row_is_header = previous.first_row_is_header;
+                    state.skip_rows = previous.skip_rows;
+                    state.delimiter = previous.delimiter;
+                    state.number_format = previous.number_format;
+                }
+                if let Some(panel) = self.ivars().formatting_panel.borrow().as_ref() {
+                    panel
+                        .error_label
+                        .setStringValue(&NSString::from_str(&err.to_string()));
+                }
+                self.ivars().state.borrow_mut().last_error = Some(err.to_string());
+                return;
+            }
+            self.ivars().state.borrow_mut().last_error = None;
+            self.rebuild_columns();
+            self.refresh_table();
+            NSApplication::sharedApplication(self.mtm()).stopModalWithCode(NSModalResponseOK);
+        }
+
+        #[unsafe(method(cancelFormatting:))]
+        fn cancel_formatting(&self, _sender: &AnyObject) {
             NSApplication::sharedApplication(self.mtm()).stopModalWithCode(NSModalResponseCancel);
         }
 
@@ -853,7 +914,9 @@ define_class!(
 impl Delegate {
     fn new(mtm: MainThreadMarker) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(AppDelegateIvars::default());
-        unsafe { msg_send![super(this), init] }
+        let this: Retained<Self> = unsafe { msg_send![super(this), init] };
+        this.ivars().state.borrow_mut().number_format = user_locale_number_format();
+        this
     }
 
     fn show_window(&self, mtm: MainThreadMarker) {
@@ -1110,17 +1173,9 @@ impl Delegate {
 
         let table_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str("Table"));
         table_menu.addItem(&menu_item(
-            "Toggle Header Row",
+            "Formatting...",
             delegate_target,
-            Some(sel!(menuToggleHeader:)),
-            "",
-            NSEventModifierFlags::empty(),
-            mtm,
-        ));
-        table_menu.addItem(&menu_item(
-            "Set Skip Rows...",
-            delegate_target,
-            Some(sel!(menuSetSkipRows:)),
+            Some(sel!(menuOpenFormatting:)),
             "",
             NSEventModifierFlags::empty(),
             mtm,
@@ -1236,62 +1291,37 @@ impl Delegate {
         );
 
         let target = unsafe { any_ref(self) };
-        let header = button("Header", target, sel!(toggleHeader:), mtm, 16.0, 10.0, 86.0);
-        header.setButtonType(NSButtonType::Switch);
-        header.setState(if self.ivars().state.borrow().first_row_is_header {
-            NSControlStateValueOn
-        } else {
-            NSControlStateValueOff
-        });
-        toolbar.addSubview(&header);
-        self.ivars().header_checkbox.set(header).ok();
-
-        let skip_label = NSTextField::labelWithString(&NSString::from_str("Skip rows"), mtm);
-        skip_label.setFrame(NSRect::new(
-            NSPoint::new(110.0, 13.0),
-            NSSize::new(62.0, 18.0),
-        ));
-        skip_label.setTextColor(Some(&NSColor::secondaryLabelColor()));
-        skip_label.setFont(Some(&NSFont::systemFontOfSize(12.0)));
-        toolbar.addSubview(&skip_label);
-
-        let skip = NSTextField::textFieldWithString(
-            &NSString::from_str(&self.ivars().state.borrow().skip_rows.to_string()),
+        toolbar.addSubview(&button(
+            "Formatting",
+            target,
+            sel!(openFormatting:),
             mtm,
-        );
-        skip.setFrame(NSRect::new(
-            NSPoint::new(178.0, 10.0),
-            NSSize::new(58.0, 24.0),
+            16.0,
+            10.0,
+            96.0,
         ));
-        skip.setPlaceholderString(Some(&NSString::from_str("Skip")));
-        unsafe {
-            skip.setTarget(Some(target));
-            skip.setAction(Some(sel!(applySkipRows:)));
-        }
-        toolbar.addSubview(&skip);
-        self.ivars().skip_field.set(skip).ok();
 
         toolbar.addSubview(&button(
             "Sort/Filter",
             target,
             sel!(openSortFilter:),
             mtm,
-            250.0,
+            124.0,
             10.0,
             92.0,
         ));
 
         let controls = [
-            ("Undo", sel!(undoChange:), 356.0, 56.0),
-            ("Redo", sel!(redoChange:), 416.0, 56.0),
-            ("+ Row", sel!(addRow:), 488.0, 56.0),
-            ("+ Col", sel!(addColumn:), 548.0, 54.0),
-            ("Delete", sel!(deleteSelection:), 606.0, 60.0),
-            ("Row Up", sel!(rowUp:), 674.0, 62.0),
-            ("Row Down", sel!(rowDown:), 740.0, 76.0),
-            ("Col Left", sel!(columnLeft:), 822.0, 70.0),
-            ("Col Right", sel!(columnRight:), 900.0, 76.0),
-            ("Save", sel!(saveDocument:), 984.0, 54.0),
+            ("Undo", sel!(undoChange:), 230.0, 56.0),
+            ("Redo", sel!(redoChange:), 290.0, 56.0),
+            ("+ Row", sel!(addRow:), 362.0, 56.0),
+            ("+ Col", sel!(addColumn:), 422.0, 54.0),
+            ("Delete", sel!(deleteSelection:), 480.0, 60.0),
+            ("Row Up", sel!(rowUp:), 548.0, 62.0),
+            ("Row Down", sel!(rowDown:), 614.0, 76.0),
+            ("Col Left", sel!(columnLeft:), 696.0, 70.0),
+            ("Col Right", sel!(columnRight:), 774.0, 76.0),
+            ("Save", sel!(saveDocument:), 858.0, 54.0),
         ];
         for (title, action, x, width) in controls {
             toolbar.addSubview(&button(title, target, action, mtm, x, 10.0, width));
@@ -1364,6 +1394,228 @@ impl Delegate {
 
         self.ivars().table.set(table).ok();
         scroll
+    }
+
+    fn present_formatting_panel(&self) {
+        let mtm = self.mtm();
+        let window = unsafe {
+            NSWindow::initWithContentRect_styleMask_backing_defer(
+                NSWindow::alloc(mtm),
+                NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(460.0, 306.0)),
+                NSWindowStyleMask::Titled,
+                NSBackingStoreType::Buffered,
+                false,
+            )
+        };
+        unsafe { window.setReleasedWhenClosed(false) };
+        window.setTitle(&NSString::from_str("Formatting"));
+
+        let panel = self.build_formatting_panel(window.clone(), "");
+        self.ivars().formatting_panel.replace(Some(panel));
+
+        window.center();
+        window.makeKeyAndOrderFront(None);
+        NSApplication::sharedApplication(mtm).runModalForWindow(&window);
+        window.orderOut(None);
+        self.ivars().formatting_panel.replace(None);
+    }
+
+    fn build_formatting_panel(&self, window: Retained<NSWindow>, error: &str) -> FormattingPanel {
+        let mtm = self.mtm();
+        let target = unsafe { any_ref(self) };
+        let width = 460.0;
+        let height = 306.0;
+        window.setContentSize(NSSize::new(width, height));
+
+        let state = self.ivars().state.borrow();
+        let content = NSView::initWithFrame(
+            NSView::alloc(mtm),
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, height)),
+        );
+
+        let header = button(
+            "Header row",
+            target,
+            sel!(toggleHeader:),
+            mtm,
+            24.0,
+            250.0,
+            120.0,
+        );
+        header.setButtonType(NSButtonType::Switch);
+        unsafe {
+            header.setTarget(None);
+            header.setAction(None);
+        }
+        header.setState(if state.first_row_is_header {
+            NSControlStateValueOn
+        } else {
+            NSControlStateValueOff
+        });
+        content.addSubview(&header);
+
+        content.addSubview(&field_label("Skip rows", mtm, 24.0, 214.0, 110.0));
+        let skip_rows = NSTextField::textFieldWithString(
+            &NSString::from_str(&state.skip_rows.to_string()),
+            mtm,
+        );
+        skip_rows.setFrame(NSRect::new(
+            NSPoint::new(150.0, 210.0),
+            NSSize::new(92.0, 24.0),
+        ));
+        skip_rows.setPlaceholderString(Some(&NSString::from_str("0")));
+        content.addSubview(&skip_rows);
+
+        content.addSubview(&section_label("Separators", mtm, 24.0, 170.0));
+        content.addSubview(&field_label("CSV separator", mtm, 24.0, 136.0, 110.0));
+        let delimiter = popup(
+            &delimiter_titles(),
+            delimiter_index(state.delimiter),
+            mtm,
+            150.0,
+            132.0,
+            132.0,
+        );
+        content.addSubview(&delimiter);
+
+        let custom_delimiter = NSTextField::textFieldWithString(
+            &NSString::from_str(&custom_delimiter_text(state.delimiter)),
+            mtm,
+        );
+        custom_delimiter.setFrame(NSRect::new(
+            NSPoint::new(294.0, 132.0),
+            NSSize::new(48.0, 24.0),
+        ));
+        custom_delimiter.setPlaceholderString(Some(&NSString::from_str("x")));
+        content.addSubview(&custom_delimiter);
+
+        content.addSubview(&field_label("Thousands", mtm, 24.0, 100.0, 110.0));
+        let grouping_separator = NSTextField::textFieldWithString(
+            &NSString::from_str(&state.number_format.grouping_separator.to_string()),
+            mtm,
+        );
+        grouping_separator.setFrame(NSRect::new(
+            NSPoint::new(150.0, 96.0),
+            NSSize::new(92.0, 24.0),
+        ));
+        content.addSubview(&grouping_separator);
+
+        content.addSubview(&field_label("Decimals", mtm, 252.0, 100.0, 76.0));
+        let decimal_separator = NSTextField::textFieldWithString(
+            &NSString::from_str(&state.number_format.decimal_separator.to_string()),
+            mtm,
+        );
+        decimal_separator.setFrame(NSRect::new(
+            NSPoint::new(336.0, 96.0),
+            NSSize::new(92.0, 24.0),
+        ));
+        content.addSubview(&decimal_separator);
+
+        let error_label = muted_label(error, mtm, 24.0, 58.0, 280.0);
+        error_label.setTextColor(Some(&NSColor::systemRedColor()));
+        content.addSubview(&error_label);
+
+        let cancel = button(
+            "Cancel",
+            target,
+            sel!(cancelFormatting:),
+            mtm,
+            276.0,
+            24.0,
+            76.0,
+        );
+        let done = button(
+            "Done",
+            target,
+            sel!(doneFormatting:),
+            mtm,
+            364.0,
+            24.0,
+            72.0,
+        );
+        done.setKeyEquivalent(&NSString::from_str("\r"));
+        cancel.setKeyEquivalent(&NSString::from_str("\u{1b}"));
+        content.addSubview(&cancel);
+        content.addSubview(&done);
+
+        drop(state);
+        window.setContentView(Some(&content));
+        FormattingPanel {
+            header,
+            skip_rows,
+            delimiter,
+            custom_delimiter,
+            grouping_separator,
+            decimal_separator,
+            error_label,
+        }
+    }
+
+    fn collect_formatting_draft(&self) -> Option<FormattingDraft> {
+        let panel_ref = self.ivars().formatting_panel.borrow();
+        let panel = panel_ref.as_ref()?;
+
+        let skip_rows = match panel
+            .skip_rows
+            .stringValue()
+            .to_string()
+            .trim()
+            .parse::<usize>()
+        {
+            Ok(value) => value,
+            Err(_) => {
+                panel
+                    .error_label
+                    .setStringValue(&NSString::from_str("Skip rows must be a whole number."));
+                return None;
+            }
+        };
+        let delimiter = match delimiter_at(
+            panel.delimiter.indexOfSelectedItem(),
+            &panel.custom_delimiter.stringValue().to_string(),
+        ) {
+            Ok(value) => value,
+            Err(err) => {
+                panel.error_label.setStringValue(&NSString::from_str(&err));
+                return None;
+            }
+        };
+        let grouping_separator = match single_character(
+            &panel.grouping_separator.stringValue().to_string(),
+            "Thousands separator",
+        ) {
+            Ok(value) => value,
+            Err(err) => {
+                panel.error_label.setStringValue(&NSString::from_str(&err));
+                return None;
+            }
+        };
+        let decimal_separator = match single_character(
+            &panel.decimal_separator.stringValue().to_string(),
+            "Decimal separator",
+        ) {
+            Ok(value) => value,
+            Err(err) => {
+                panel.error_label.setStringValue(&NSString::from_str(&err));
+                return None;
+            }
+        };
+        if grouping_separator == decimal_separator {
+            panel.error_label.setStringValue(&NSString::from_str(
+                "Thousands and decimal separators must differ.",
+            ));
+            return None;
+        }
+
+        Some(FormattingDraft {
+            first_row_is_header: panel.header.state() == NSControlStateValueOn,
+            skip_rows,
+            delimiter,
+            number_format: NumberFormat {
+                grouping_separator,
+                decimal_separator,
+            },
+        })
     }
 
     fn present_sort_filter_panel(&self) {
@@ -1955,6 +2207,13 @@ enum CloseChoice {
     Cancel,
 }
 
+struct FormattingDraft {
+    first_row_is_header: bool,
+    skip_rows: usize,
+    delimiter: u8,
+    number_format: NumberFormat,
+}
+
 fn apply_table_cell_style(
     cell: &NSTextFieldCell,
     visible_column: Option<VisibleColumn>,
@@ -1992,6 +2251,30 @@ fn user_accent_color() -> Retained<NSColor> {
         None => NSColor::systemBlueColor(),
         Some(_) if defaults.integerForKey(&accent_key) == -1 => NSColor::systemBlueColor(),
         Some(_) => NSColor::controlAccentColor(),
+    }
+}
+
+fn user_locale_number_format() -> NumberFormat {
+    let locale = NSLocale::currentLocale();
+    let grouping_separator = locale
+        .groupingSeparator()
+        .to_string()
+        .chars()
+        .next()
+        .unwrap_or(',');
+    let decimal_separator = locale
+        .decimalSeparator()
+        .to_string()
+        .chars()
+        .next()
+        .unwrap_or('.');
+    if grouping_separator == decimal_separator {
+        NumberFormat::default()
+    } else {
+        NumberFormat {
+            grouping_separator,
+            decimal_separator,
+        }
     }
 }
 
@@ -2159,6 +2442,20 @@ fn section_label(title: &str, mtm: MainThreadMarker, x: f64, y: f64) -> Retained
     label
 }
 
+fn field_label(
+    title: &str,
+    mtm: MainThreadMarker,
+    x: f64,
+    y: f64,
+    width: f64,
+) -> Retained<NSTextField> {
+    let label = NSTextField::labelWithString(&NSString::from_str(title), mtm);
+    label.setFrame(NSRect::new(NSPoint::new(x, y), NSSize::new(width, 20.0)));
+    label.setFont(Some(&NSFont::systemFontOfSize(12.0)));
+    label.setTextColor(Some(&NSColor::secondaryLabelColor()));
+    label
+}
+
 fn muted_label(
     title: &str,
     mtm: MainThreadMarker,
@@ -2195,6 +2492,69 @@ fn popup(
         popup.selectItemAtIndex(selected.min(titles.len() - 1) as NSInteger);
     }
     popup
+}
+
+fn delimiter_titles() -> Vec<String> {
+    ["Comma", "Semicolon", "Tab", "Pipe", "Colon", "Custom"]
+        .iter()
+        .map(|title| title.to_string())
+        .collect()
+}
+
+fn delimiter_index(delimiter: u8) -> usize {
+    match delimiter {
+        b',' => 0,
+        b';' => 1,
+        b'\t' => 2,
+        b'|' => 3,
+        b':' => 4,
+        _ => 5,
+    }
+}
+
+fn custom_delimiter_text(delimiter: u8) -> String {
+    if delimiter_index(delimiter) == 5 {
+        (delimiter as char).to_string()
+    } else {
+        String::new()
+    }
+}
+
+fn delimiter_at(index: NSInteger, custom: &str) -> std::result::Result<u8, String> {
+    match index {
+        0 => Ok(b','),
+        1 => Ok(b';'),
+        2 => Ok(b'\t'),
+        3 => Ok(b'|'),
+        4 => Ok(b':'),
+        _ => custom_delimiter(custom),
+    }
+}
+
+fn custom_delimiter(value: &str) -> std::result::Result<u8, String> {
+    let delimiter = if value == r"\t" {
+        '\t'
+    } else {
+        single_character(value, "Custom separator")?
+    };
+    if delimiter == '\n' || delimiter == '\r' || delimiter == '"' {
+        return Err("Custom separator cannot be a quote or line break.".to_string());
+    }
+    if !delimiter.is_ascii() {
+        return Err("Custom separator must be one ASCII character.".to_string());
+    }
+    Ok(delimiter as u8)
+}
+
+fn single_character(value: &str, label: &str) -> std::result::Result<char, String> {
+    let mut chars = value.chars();
+    let Some(ch) = chars.next() else {
+        return Err(format!("{label} must be one character."));
+    };
+    if chars.next().is_some() {
+        return Err(format!("{label} must be one character."));
+    }
+    Ok(ch)
 }
 
 fn filter_operator_titles() -> Vec<String> {

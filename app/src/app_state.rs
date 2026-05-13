@@ -1,7 +1,7 @@
 use crate::selection::{Cell, Selection};
 use editable_csv_core::{
-    ColumnFilter, CsvDocument, CsvDocumentSnapshot, FilterRule, OpenOptions, Result, SortDirection,
-    SortKey,
+    ColumnFilter, CsvDocument, CsvDocumentSnapshot, FilterRule, NumberFormat, OpenOptions, Result,
+    SortDirection, SortKey,
 };
 use std::path::{Path, PathBuf};
 
@@ -21,6 +21,8 @@ pub struct EditableState {
     pub selection: Selection,
     pub first_row_is_header: bool,
     pub skip_rows: usize,
+    pub delimiter: u8,
+    pub number_format: NumberFormat,
     pub filter_text: String,
     pub last_error: Option<String>,
     undo_stack: Vec<HistoryEntry>,
@@ -34,6 +36,8 @@ impl Default for EditableState {
             selection: Selection::default(),
             first_row_is_header: true,
             skip_rows: 0,
+            delimiter: b',',
+            number_format: NumberFormat::default(),
             filter_text: String::new(),
             last_error: None,
             undo_stack: Vec::new(),
@@ -45,13 +49,7 @@ impl Default for EditableState {
 #[allow(dead_code)]
 impl EditableState {
     pub fn open_path(&mut self, path: impl AsRef<Path>) -> Result<()> {
-        let document = CsvDocument::open(
-            path,
-            OpenOptions {
-                first_row_is_header: self.first_row_is_header,
-                skip_rows: self.skip_rows,
-            },
-        )?;
+        let document = CsvDocument::open(path, self.open_options())?;
         self.document = Some(document);
         self.selection = Selection::default();
         self.last_error = None;
@@ -67,14 +65,8 @@ impl EditableState {
             self.open_path(path)
         } else {
             let was_dirty = doc.is_dirty();
-            let bytes = doc.to_csv_bytes();
-            let mut document = CsvDocument::from_bytes(
-                bytes,
-                OpenOptions {
-                    first_row_is_header: self.first_row_is_header,
-                    skip_rows: self.skip_rows,
-                },
-            )?;
+            let bytes = doc.to_csv_bytes_with_delimiter(self.delimiter);
+            let mut document = CsvDocument::from_bytes(bytes, self.open_options())?;
             document.set_dirty(was_dirty);
             self.document = Some(document);
             self.selection = Selection::default();
@@ -508,17 +500,25 @@ impl EditableState {
             blank_csv_bytes(
                 self.skip_rows + BLANK_DOCUMENT_ROWS + usize::from(self.first_row_is_header),
                 BLANK_DOCUMENT_COLUMNS,
+                self.delimiter,
             ),
-            OpenOptions {
-                first_row_is_header: self.first_row_is_header,
-                skip_rows: self.skip_rows,
-            },
+            self.open_options(),
         )
+    }
+
+    fn open_options(&self) -> OpenOptions {
+        OpenOptions {
+            first_row_is_header: self.first_row_is_header,
+            skip_rows: self.skip_rows,
+            delimiter: self.delimiter,
+            number_format: self.number_format,
+        }
     }
 }
 
-fn blank_csv_bytes(records: usize, columns: usize) -> Vec<u8> {
-    let record = ",".repeat(columns.saturating_sub(1));
+fn blank_csv_bytes(records: usize, columns: usize, delimiter: u8) -> Vec<u8> {
+    let delimiter = delimiter as char;
+    let record = delimiter.to_string().repeat(columns.saturating_sub(1));
     (0..records)
         .map(|_| record.as_str())
         .collect::<Vec<_>>()
