@@ -185,11 +185,13 @@ fn info_plist() -> String {
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
-  <string>0.1.0</string>
+  <string>1</string>
   <key>CFBundleVersion</key>
   <string>1</string>
   <key>LSMinimumSystemVersion</key>
   <string>13.0</string>
+  <key>NSHumanReadableCopyright</key>
+  <string>Copyright 2026 Ali Colgecen</string>
   <key>NSHighResolutionCapable</key>
   <true/>
   <key>NSPrincipalClass</key>
