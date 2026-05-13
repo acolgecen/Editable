@@ -65,7 +65,7 @@ impl EditableState {
             self.open_path(path)
         } else {
             let was_dirty = doc.is_dirty();
-            let bytes = doc.to_csv_bytes_with_delimiter(self.delimiter);
+            let bytes = doc.to_csv_bytes_with_delimiter_untrimmed(self.delimiter);
             let mut document = CsvDocument::from_bytes(bytes, self.open_options())?;
             document.set_dirty(was_dirty);
             self.document = Some(document);

@@ -500,40 +500,66 @@ impl CsvDocument {
     }
 
     pub fn to_csv_bytes(&self) -> Vec<u8> {
-        self.to_csv_bytes_with_dialect(self.dialect)
+        self.to_csv_bytes_with_dialect(self.dialect, true)
     }
 
     pub fn to_csv_bytes_with_delimiter(&self, delimiter: u8) -> Vec<u8> {
         let mut dialect = self.dialect;
         dialect.delimiter = delimiter;
-        self.to_csv_bytes_with_dialect(dialect)
+        self.to_csv_bytes_with_dialect(dialect, true)
     }
 
-    fn to_csv_bytes_with_dialect(&self, dialect: CsvDialect) -> Vec<u8> {
-        let mut out = String::new();
-        for row in &self.skipped_rows {
-            write_record(&mut out, row, dialect);
-            out.push_str(dialect.line_ending.as_str());
-        }
-        if let Some(headers) = &self.headers {
-            let visible_headers = (0..self.column_count())
-                .map(|column| {
-                    self.real_column(column)
-                        .and_then(|real| headers.get(real))
-                        .cloned()
-                        .unwrap_or_default()
-                })
-                .collect::<Vec<_>>();
-            write_record(&mut out, &visible_headers, dialect);
-            out.push_str(dialect.line_ending.as_str());
-        }
+    pub fn to_csv_bytes_with_delimiter_untrimmed(&self, delimiter: u8) -> Vec<u8> {
+        let mut dialect = self.dialect;
+        dialect.delimiter = delimiter;
+        self.to_csv_bytes_with_dialect(dialect, false)
+    }
 
-        for row in 0..self.row_count() {
-            let values = (0..self.column_count())
-                .map(|column| self.cell(row, column).unwrap_or_default())
-                .collect::<Vec<_>>();
-            write_record(&mut out, &values, dialect);
-            if row + 1 < self.row_count() {
+    fn to_csv_bytes_with_dialect(&self, dialect: CsvDialect, trim_empty_edges: bool) -> Vec<u8> {
+        let data_rows = (0..self.row_count())
+            .map(|row| {
+                (0..self.column_count())
+                    .map(|column| self.cell(row, column).unwrap_or_default())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let retained_data_rows = if trim_empty_edges {
+            retained_row_count(&data_rows)
+        } else {
+            data_rows.len()
+        };
+        let retained_columns = if trim_empty_edges {
+            retained_column_count(self, &data_rows[..retained_data_rows])
+        } else {
+            self.column_count()
+        };
+
+        let mut records = Vec::new();
+        records.extend(self.skipped_rows.iter().cloned());
+        if let Some(headers) = &self.headers {
+            if retained_columns > 0 || !trim_empty_edges {
+                let visible_headers = (0..retained_columns)
+                    .map(|column| {
+                        self.real_column(column)
+                            .and_then(|real| headers.get(real))
+                            .cloned()
+                            .unwrap_or_default()
+                    })
+                    .collect::<Vec<_>>();
+                records.push(visible_headers);
+            }
+        }
+        records.extend(
+            data_rows
+                .iter()
+                .take(retained_data_rows)
+                .map(|row| trimmed_record(row, retained_columns)),
+        );
+
+        let mut out = String::new();
+        for (idx, record) in records.iter().enumerate() {
+            write_record(&mut out, record, dialect);
+            if idx + 1 < records.len() {
                 out.push_str(dialect.line_ending.as_str());
             }
         }
@@ -733,6 +759,44 @@ fn write_record(out: &mut String, values: &[String], dialect: CsvDialect) {
         }
         out.push_str(&encode_field(value, dialect));
     }
+}
+
+fn retained_row_count(rows: &[Vec<String>]) -> usize {
+    rows.iter()
+        .rposition(|row| row.iter().any(|value| !value.is_empty()))
+        .map(|index| index + 1)
+        .unwrap_or(0)
+}
+
+fn retained_column_count(document: &CsvDocument, rows: &[Vec<String>]) -> usize {
+    let header_count = document.headers.as_ref().map_or(0, |headers| {
+        (0..document.column_count())
+            .rposition(|column| {
+                document
+                    .real_column(column)
+                    .and_then(|real| headers.get(real))
+                    .is_some_and(|value| !value.is_empty())
+            })
+            .map(|column| column + 1)
+            .unwrap_or(0)
+    });
+    let row_count = rows
+        .iter()
+        .filter_map(|row| {
+            row.iter()
+                .rposition(|value| !value.is_empty())
+                .map(|column| column + 1)
+        })
+        .max()
+        .unwrap_or(0);
+    header_count.max(row_count)
+}
+
+fn trimmed_record(row: &[String], retained_columns: usize) -> Vec<String> {
+    row.iter()
+        .take(retained_columns)
+        .cloned()
+        .collect::<Vec<_>>()
 }
 
 fn naturalish_cmp(left: &str, right: &str, number_format: NumberFormat) -> Ordering {
@@ -939,6 +1003,30 @@ mod tests {
         doc.delete_row(0).unwrap();
         let text = String::from_utf8(doc.to_csv_bytes()).unwrap();
         assert_eq!(text, "generated by tool\nyear,name\n1985,Excel");
+    }
+
+    #[test]
+    fn saving_trims_trailing_empty_rows_and_columns() {
+        let doc = CsvDocument::from_bytes(
+            b"name,year,,\nAda,1843,,\n,,,\n".to_vec(),
+            OpenOptions::default(),
+        )
+        .unwrap();
+
+        let text = String::from_utf8(doc.to_csv_bytes()).unwrap();
+        assert_eq!(text, "name,year\nAda,1843");
+    }
+
+    #[test]
+    fn saving_preserves_empty_rows_and_columns_inside_data() {
+        let doc = CsvDocument::from_bytes(
+            b"name,,year,\nAda,,1843,\n,,,\nGrace,,1952,\n,,,\n".to_vec(),
+            OpenOptions::default(),
+        )
+        .unwrap();
+
+        let text = String::from_utf8(doc.to_csv_bytes()).unwrap();
+        assert_eq!(text, "name,,year\nAda,,1843\n,,\nGrace,,1952");
     }
 
     #[test]

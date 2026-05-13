@@ -12,11 +12,12 @@ use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadOnly, Message};
 use objc2_app_kit::{
     NSAlert, NSAlertFirstButtonReturn, NSAlertSecondButtonReturn, NSAlertStyle,
     NSAlertThirdButtonReturn, NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate,
-    NSAutoresizingMaskOptions, NSBackingStoreType, NSBezelStyle, NSBorderType, NSButton,
-    NSButtonType, NSCellImagePosition, NSColor, NSControlStateValueOff, NSControlStateValueOn,
-    NSControlTextEditingDelegate, NSEvent, NSEventModifierFlags, NSFont, NSImage, NSImageScaling,
-    NSMenu, NSMenuItem, NSModalResponseCancel, NSModalResponseOK, NSOpenPanel, NSPopUpButton,
-    NSSavePanel, NSScrollView, NSTableColumn, NSTableView, NSTableViewColumnAutoresizingStyle,
+    NSApplicationLaunchIsDefaultLaunchKey, NSAutoresizingMaskOptions, NSBackingStoreType,
+    NSBezelStyle, NSBorderType, NSButton, NSButtonType, NSCellImagePosition, NSColor,
+    NSControlStateValueOff, NSControlStateValueOn, NSControlTextEditingDelegate, NSEvent,
+    NSEventModifierFlags, NSFont, NSImage, NSImageNameApplicationIcon, NSImageScaling, NSMenu,
+    NSMenuItem, NSModalResponseCancel, NSModalResponseOK, NSOpenPanel, NSPopUpButton, NSSavePanel,
+    NSScrollView, NSTableColumn, NSTableView, NSTableViewColumnAutoresizingStyle,
     NSTableViewDataSource, NSTableViewDelegate, NSTableViewGridLineStyle,
     NSTableViewSelectionHighlightStyle, NSTextAlignment, NSTextField, NSTextFieldCell, NSView,
     NSWindow, NSWindowDelegate, NSWindowStyleMask,
@@ -237,29 +238,41 @@ define_class!(
             app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
             #[allow(deprecated)]
             app.activateIgnoringOtherApps(true);
+            disable_window_restoration();
             self.install_main_menu(&app);
 
-            {
-                let mut state = self.ivars().state.borrow_mut();
-                if state.document.is_some() {
-                    state.last_error = None;
-                } else if let Some(path) = launch_path_arg() {
-                    if let Err(err) = state.open_path(path) {
-                        state.last_error = Some(err.to_string());
-                    }
-                } else {
-                    if let Err(err) = state.open_blank() {
+            if let Some(path) = launch_path_arg() {
+                {
+                    let mut state = self.ivars().state.borrow_mut();
+                    if state.document.is_some() {
+                        state.last_error = None;
+                    } else if let Err(err) = state.open_path(path) {
                         state.last_error = Some(err.to_string());
                     }
                 }
+                self.show_window(mtm);
+            } else if launch_is_default_launch(notification) {
+                self.present_welcome_window();
             }
+        }
 
-            self.show_window(mtm);
+        #[unsafe(method(applicationShouldOpenUntitledFile:))]
+        fn should_open_untitled_file(&self, _app: &NSApplication) -> bool {
+            false
         }
 
         #[unsafe(method(applicationShouldTerminateAfterLastWindowClosed:))]
         fn should_terminate_after_last_window_closed(&self, _app: &NSApplication) -> bool {
             false
+        }
+
+        #[unsafe(method(applicationShouldHandleReopen:hasVisibleWindows:))]
+        fn should_handle_reopen(&self, _app: &NSApplication, has_visible_windows: bool) -> Bool {
+            if !has_visible_windows {
+                self.present_welcome_window();
+                return false.into();
+            }
+            true.into()
         }
 
         #[unsafe(method(application:openFile:))]
@@ -1000,6 +1013,8 @@ impl Delegate {
             )
         };
         unsafe { window.setReleasedWhenClosed(false) };
+        window.setRestorable(false);
+        window.disableSnapshotRestoration();
         window.setTitle(&NSString::from_str(&self.ivars().state.borrow().title()));
         window.setContentMinSize(NSSize::new(860.0, 520.0));
 
@@ -1020,6 +1035,24 @@ impl Delegate {
         self.ivars().window.set(window).ok();
         self.rebuild_columns();
         self.refresh_table();
+    }
+
+    fn present_welcome_window(&self) {
+        match choose_welcome_action(self.mtm()) {
+            WelcomeChoice::New => {
+                let result = self.ivars().state.borrow_mut().open_blank();
+                if result.is_ok() {
+                    self.show_window(self.mtm());
+                }
+                self.handle_result(result);
+            }
+            WelcomeChoice::Open => {
+                if let Some(path) = choose_startup_file(self.mtm()) {
+                    self.open_window_for_path(path);
+                }
+            }
+            WelcomeChoice::Cancel => {}
+        }
     }
 
     fn open_window_for_path(&self, path: PathBuf) -> bool {
@@ -2308,6 +2341,13 @@ enum CloseChoice {
     Cancel,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WelcomeChoice {
+    New,
+    Open,
+    Cancel,
+}
+
 struct FormattingDraft {
     first_row_is_header: bool,
     skip_rows: usize,
@@ -2353,6 +2393,23 @@ fn user_accent_color() -> Retained<NSColor> {
         Some(_) if defaults.integerForKey(&accent_key) == -1 => NSColor::systemBlueColor(),
         Some(_) => NSColor::controlAccentColor(),
     }
+}
+
+fn disable_window_restoration() {
+    NSUserDefaults::standardUserDefaults()
+        .setBool_forKey(false, &NSString::from_str("NSQuitAlwaysKeepsWindows"));
+}
+
+fn launch_is_default_launch(notification: &NSNotification) -> bool {
+    let Some(user_info) = notification.userInfo() else {
+        return true;
+    };
+    let user_info = unsafe { user_info.cast_unchecked::<NSString, AnyObject>() };
+    let launch_key = unsafe { NSApplicationLaunchIsDefaultLaunchKey };
+    let Some(value) = user_info.objectForKey(launch_key) else {
+        return true;
+    };
+    unsafe { msg_send![&*value, boolValue] }
 }
 
 fn user_locale_number_format() -> NumberFormat {
@@ -2440,6 +2497,28 @@ fn choose_startup_file(mtm: MainThreadMarker) -> Option<PathBuf> {
         panel.URL().and_then(|url| url.to_file_path())
     } else {
         None
+    }
+}
+
+fn choose_welcome_action(mtm: MainThreadMarker) -> WelcomeChoice {
+    let alert = NSAlert::new(mtm);
+    alert.setAlertStyle(NSAlertStyle::Informational);
+    alert.setMessageText(&NSString::from_str("Welcome to Editable"));
+    alert.setInformativeText(&NSString::from_str(
+        "Create a fresh CSV file or open an existing one.",
+    ));
+    let application_icon = unsafe { NSImageNameApplicationIcon };
+    if let Some(icon) = NSImage::imageNamed(application_icon) {
+        unsafe { alert.setIcon(Some(&icon)) };
+    }
+    alert.addButtonWithTitle(&NSString::from_str("Create New File"));
+    alert.addButtonWithTitle(&NSString::from_str("Open Existing File"));
+    alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+
+    match alert.runModal() {
+        response if response == NSAlertFirstButtonReturn => WelcomeChoice::New,
+        response if response == NSAlertSecondButtonReturn => WelcomeChoice::Open,
+        _ => WelcomeChoice::Cancel,
     }
 }
 
