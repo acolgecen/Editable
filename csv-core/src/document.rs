@@ -15,26 +15,10 @@ pub struct CellCoord {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NumberFormat {
-    pub grouping_separator: char,
-    pub decimal_separator: char,
-}
-
-impl Default for NumberFormat {
-    fn default() -> Self {
-        Self {
-            grouping_separator: ',',
-            decimal_separator: '.',
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpenOptions {
     pub first_row_is_header: bool,
     pub skip_rows: usize,
-    pub delimiter: u8,
-    pub number_format: NumberFormat,
+    pub delimiter: Option<u8>,
 }
 
 impl Default for OpenOptions {
@@ -42,8 +26,7 @@ impl Default for OpenOptions {
         Self {
             first_row_is_header: true,
             skip_rows: 0,
-            delimiter: b',',
-            number_format: NumberFormat::default(),
+            delimiter: None,
         }
     }
 }
@@ -132,7 +115,6 @@ pub struct CsvDocument {
     path: Option<PathBuf>,
     source: Source,
     dialect: CsvDialect,
-    number_format: NumberFormat,
     records: Vec<RecordIndex>,
     skipped_rows: Vec<Vec<String>>,
     data_rows: Vec<usize>,
@@ -163,7 +145,9 @@ impl CsvDocument {
 
     fn from_source(path: Option<PathBuf>, source: Source, options: OpenOptions) -> Result<Self> {
         let mut dialect = detect_dialect(source.bytes());
-        dialect.delimiter = options.delimiter;
+        if let Some(delimiter) = options.delimiter {
+            dialect.delimiter = delimiter;
+        }
         let records = parse_records(source.bytes(), dialect)?;
         let first_data_record = options.skip_rows + usize::from(options.first_row_is_header);
         let skipped_rows = records
@@ -193,7 +177,6 @@ impl CsvDocument {
             path,
             source,
             dialect,
-            number_format: options.number_format,
             records,
             skipped_rows,
             data_rows,
@@ -493,9 +476,48 @@ impl CsvDocument {
 
     pub fn save_to(&mut self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
-        std::fs::write(path, self.to_csv_bytes())?;
-        self.path = Some(path.to_path_buf());
+        let bytes = self.to_csv_bytes();
+        std::fs::write(path, &bytes)?;
+        self.rebase_saved_bytes(path.to_path_buf(), bytes)?;
         self.dirty = false;
+        Ok(())
+    }
+
+    fn rebase_saved_bytes(&mut self, path: PathBuf, bytes: Vec<u8>) -> Result<()> {
+        let filters = self.filter_rules();
+        let sort_keys = self.sort_keys();
+        let mut saved = Self::from_source(
+            Some(path),
+            Source::Bytes(bytes),
+            OpenOptions {
+                first_row_is_header: self.headers.is_some(),
+                skip_rows: self.skipped_rows.len(),
+                delimiter: Some(self.dialect.delimiter),
+            },
+        )?;
+
+        saved.filters = filters
+            .into_iter()
+            .filter_map(|rule| {
+                saved.real_column(rule.column).map(|column| FilterRule {
+                    column,
+                    operator: rule.operator,
+                    value: rule.value,
+                })
+            })
+            .collect();
+        saved.sort_keys = sort_keys
+            .into_iter()
+            .filter_map(|key| {
+                saved.real_column(key.column).map(|column| SortKey {
+                    column,
+                    direction: key.direction,
+                })
+            })
+            .collect();
+        saved.refresh_view();
+
+        *self = saved;
         Ok(())
     }
 
@@ -605,7 +627,7 @@ impl CsvDocument {
     fn row_matches_filters(&self, data_row: usize) -> bool {
         self.filters.iter().all(|rule| {
             let value = self.cell_from_data_row(data_row, rule.column);
-            rule_matches_value(rule, &value, self.number_format)
+            rule_matches_value(rule, &value)
         })
     }
 
@@ -619,7 +641,7 @@ impl CsvDocument {
                 (true, false) => Ordering::Greater,
                 (false, true) => Ordering::Less,
                 (true, true) => Ordering::Equal,
-                (false, false) => naturalish_cmp(&left_value, &right_value, self.number_format),
+                (false, false) => naturalish_cmp(&left_value, &right_value),
             };
             if ordering != Ordering::Equal && (left_null || right_null) {
                 return ordering;
@@ -691,7 +713,7 @@ fn legacy_filter_rule(column: usize, filter: ColumnFilter) -> FilterRule {
     }
 }
 
-fn rule_matches_value(rule: &FilterRule, value: &str, number_format: NumberFormat) -> bool {
+fn rule_matches_value(rule: &FilterRule, value: &str) -> bool {
     match rule.operator {
         FilterOperator::IsEmpty => value.is_empty(),
         FilterOperator::IsNotEmpty => !value.is_empty(),
@@ -710,17 +732,17 @@ fn rule_matches_value(rule: &FilterRule, value: &str, number_format: NumberForma
             text_match(rule, value, |value, pattern| value.ends_with(pattern))
         }
         FilterOperator::GreaterThan => {
-            compare_filter_value(value, &rule.value, number_format) == Some(Ordering::Greater)
+            compare_filter_value(value, &rule.value) == Some(Ordering::Greater)
         }
         FilterOperator::GreaterThanOrEqual => matches!(
-            compare_filter_value(value, &rule.value, number_format),
+            compare_filter_value(value, &rule.value),
             Some(Ordering::Greater | Ordering::Equal)
         ),
         FilterOperator::LessThan => {
-            compare_filter_value(value, &rule.value, number_format) == Some(Ordering::Less)
+            compare_filter_value(value, &rule.value) == Some(Ordering::Less)
         }
         FilterOperator::LessThanOrEqual => matches!(
-            compare_filter_value(value, &rule.value, number_format),
+            compare_filter_value(value, &rule.value),
             Some(Ordering::Less | Ordering::Equal)
         ),
     }
@@ -730,17 +752,11 @@ fn text_match(rule: &FilterRule, value: &str, plain: impl Fn(&str, &str) -> bool
     plain(value, &rule.value)
 }
 
-fn compare_filter_value(
-    value: &str,
-    expected: &str,
-    number_format: NumberFormat,
-) -> Option<Ordering> {
-    match (
-        parse_number(value, number_format),
-        parse_number(expected, number_format),
-    ) {
-        (Ok(value), Ok(expected)) => value.partial_cmp(&expected),
-        _ => Some(value.to_lowercase().cmp(&expected.to_lowercase())),
+fn compare_filter_value(value: &str, expected: &str) -> Option<Ordering> {
+    match (parse_number(value), parse_number(expected)) {
+        (Some(value), Some(expected)) => value.partial_cmp(&expected),
+        (None, None) => Some(value.to_lowercase().cmp(&expected.to_lowercase())),
+        _ => None,
     }
 }
 
@@ -799,33 +815,19 @@ fn trimmed_record(row: &[String], retained_columns: usize) -> Vec<String> {
         .collect::<Vec<_>>()
 }
 
-fn naturalish_cmp(left: &str, right: &str, number_format: NumberFormat) -> Ordering {
-    match (
-        parse_number(left, number_format),
-        parse_number(right, number_format),
-    ) {
-        (Ok(left), Ok(right)) => left.partial_cmp(&right).unwrap_or(Ordering::Equal),
+fn naturalish_cmp(left: &str, right: &str) -> Ordering {
+    match (parse_number(left), parse_number(right)) {
+        (Some(left), Some(right)) => left.partial_cmp(&right).unwrap_or(Ordering::Equal),
         _ => left.to_lowercase().cmp(&right.to_lowercase()),
     }
 }
 
-fn parse_number(
-    value: &str,
-    number_format: NumberFormat,
-) -> std::result::Result<f64, std::num::ParseFloatError> {
-    let trimmed = value.trim();
-    let mut normalized = String::with_capacity(trimmed.len());
-    for ch in trimmed.chars() {
-        if ch == number_format.grouping_separator {
-            continue;
-        }
-        if ch == number_format.decimal_separator {
-            normalized.push('.');
-        } else {
-            normalized.push(ch);
-        }
-    }
-    normalized.parse::<f64>()
+fn parse_number(value: &str) -> Option<f64> {
+    value
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite())
 }
 
 #[cfg(test)]
@@ -880,6 +882,28 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             "name,note\nAda,saved"
         );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn save_rebases_in_memory_document_to_written_bytes() {
+        let path =
+            std::env::temp_dir().join(format!("editable-save-rebase-{}.csv", std::process::id()));
+        std::fs::write(&path, "first,second\ncell1,cell2").unwrap();
+
+        let mut doc = CsvDocument::open(&path, OpenOptions::default()).unwrap();
+        doc.set_cell(0, 1, "updated").unwrap();
+        doc.save_to(&path).unwrap();
+
+        assert!(!doc.is_dirty());
+        assert_eq!(doc.edit_stats().edited_cells, 0);
+        assert_eq!(doc.cell(0, 0).unwrap(), "cell1");
+        assert_eq!(doc.cell(0, 1).unwrap(), "updated");
+        assert_eq!(
+            String::from_utf8(doc.to_csv_bytes()).unwrap(),
+            std::fs::read_to_string(&path).unwrap()
+        );
+
         let _ = std::fs::remove_file(path);
     }
 
@@ -949,31 +973,66 @@ mod tests {
     }
 
     #[test]
-    fn custom_delimiter_and_number_format_drive_parsing_and_comparisons() {
+    fn custom_delimiter_and_dot_decimal_numbers_drive_comparisons() {
         let mut doc = CsvDocument::from_bytes(
-            b"name;amount\nSmall;1.234,50\nLarge;10.000,25\n".to_vec(),
+            b"name;amount\nSmall;1.25\nLarge;10.5\n".to_vec(),
             OpenOptions {
-                delimiter: b';',
-                number_format: NumberFormat {
-                    grouping_separator: '.',
-                    decimal_separator: ',',
-                },
+                delimiter: Some(b';'),
                 ..OpenOptions::default()
             },
         )
         .unwrap();
 
-        assert_eq!(doc.cell(0, 1).unwrap(), "1.234,50");
+        assert_eq!(doc.cell(0, 1).unwrap(), "1.25");
         doc.set_filter_rules(vec![FilterRule {
             column: 1,
             operator: FilterOperator::GreaterThan,
-            value: "2.000,00".to_string(),
+            value: "2.0".to_string(),
         }])
         .unwrap();
         assert_eq!(doc.cell(0, 0).unwrap(), "Large");
 
         let text = String::from_utf8(doc.to_csv_bytes()).unwrap();
-        assert_eq!(text, "name;amount\nLarge;10.000,25");
+        assert_eq!(text, "name;amount\nLarge;10.5");
+    }
+
+    #[test]
+    fn comma_decimal_values_remain_text_not_locale_numbers() {
+        let mut doc = CsvDocument::from_bytes(
+            b"name;amount\nSmall;1,25\nLarge;10,5\n".to_vec(),
+            OpenOptions {
+                delimiter: Some(b';'),
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+
+        doc.set_filter_rules(vec![FilterRule {
+            column: 1,
+            operator: FilterOperator::GreaterThan,
+            value: "2.0".to_string(),
+        }])
+        .unwrap();
+
+        assert_eq!(doc.row_count(), 0);
+    }
+
+    #[test]
+    fn default_open_options_auto_detect_delimiter_before_saving() {
+        let mut doc = CsvDocument::from_bytes(
+            b"name;amount\nAda;1,23\nGrace;4,56\n".to_vec(),
+            OpenOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(doc.dialect().delimiter, b';');
+        assert_eq!(doc.column_count(), 2);
+        assert_eq!(doc.cell(0, 0).unwrap(), "Ada");
+        assert_eq!(doc.cell(0, 1).unwrap(), "1,23");
+
+        doc.set_cell(0, 0, "Augusta").unwrap();
+        let text = String::from_utf8(doc.to_csv_bytes()).unwrap();
+        assert_eq!(text, "name;amount\nAugusta;1,23\nGrace;4,56");
     }
 
     #[test]

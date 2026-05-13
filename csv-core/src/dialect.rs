@@ -151,10 +151,20 @@ fn detect_delimiter(bytes: &[u8]) -> u8 {
         i += 1;
     }
 
+    if line_has_data {
+        for (idx, count) in current_counts.iter().copied().enumerate() {
+            scores[idx].0 += count;
+            if count > 0 {
+                scores[idx].1 += 1;
+            }
+        }
+    }
+
     CANDIDATES
         .iter()
         .copied()
         .enumerate()
+        .filter(|(idx, _)| scores[*idx].0 > 0)
         .max_by_key(|(idx, _)| {
             let (total, populated_lines) = scores[*idx];
             populated_lines * 1_000 + total
@@ -182,5 +192,17 @@ mod tests {
 "#,
         );
         assert_eq!(dialect.delimiter, b';');
+    }
+
+    #[test]
+    fn detects_delimiter_without_trailing_newline() {
+        let dialect = detect_dialect(b"name;amount;note");
+        assert_eq!(dialect.delimiter, b';');
+    }
+
+    #[test]
+    fn defaults_to_comma_when_no_delimiter_is_present() {
+        let dialect = detect_dialect(b"plain text only");
+        assert_eq!(dialect.delimiter, b',');
     }
 }

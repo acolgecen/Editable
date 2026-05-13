@@ -1,7 +1,7 @@
 use crate::selection::{Cell, Selection};
 use editable_csv_core::{
-    ColumnFilter, CsvDocument, CsvDocumentSnapshot, FilterRule, NumberFormat, OpenOptions, Result,
-    SortDirection, SortKey,
+    ColumnFilter, CsvDocument, CsvDocumentSnapshot, FilterRule, OpenOptions, Result, SortDirection,
+    SortKey,
 };
 use std::path::{Path, PathBuf};
 
@@ -22,7 +22,6 @@ pub struct EditableState {
     pub first_row_is_header: bool,
     pub skip_rows: usize,
     pub delimiter: u8,
-    pub number_format: NumberFormat,
     pub filter_text: String,
     pub last_error: Option<String>,
     undo_stack: Vec<HistoryEntry>,
@@ -37,7 +36,6 @@ impl Default for EditableState {
             first_row_is_header: true,
             skip_rows: 0,
             delimiter: b',',
-            number_format: NumberFormat::default(),
             filter_text: String::new(),
             last_error: None,
             undo_stack: Vec::new(),
@@ -49,7 +47,8 @@ impl Default for EditableState {
 #[allow(dead_code)]
 impl EditableState {
     pub fn open_path(&mut self, path: impl AsRef<Path>) -> Result<()> {
-        let document = CsvDocument::open(path, self.open_options())?;
+        let document = CsvDocument::open(path, self.open_options(None))?;
+        self.delimiter = document.dialect().delimiter;
         self.document = Some(document);
         self.selection = Selection::default();
         self.last_error = None;
@@ -62,11 +61,17 @@ impl EditableState {
             return self.open_blank();
         };
         if let Some(path) = doc.path().map(Path::to_path_buf) {
-            self.open_path(path)
+            let document = CsvDocument::open(path, self.open_options(Some(self.delimiter)))?;
+            self.document = Some(document);
+            self.selection = Selection::default();
+            self.last_error = None;
+            self.clear_history();
+            Ok(())
         } else {
             let was_dirty = doc.is_dirty();
             let bytes = doc.to_csv_bytes_with_delimiter_untrimmed(self.delimiter);
-            let mut document = CsvDocument::from_bytes(bytes, self.open_options())?;
+            let mut document =
+                CsvDocument::from_bytes(bytes, self.open_options(Some(self.delimiter)))?;
             document.set_dirty(was_dirty);
             self.document = Some(document);
             self.selection = Selection::default();
@@ -87,7 +92,9 @@ impl EditableState {
 
     pub fn open_sample(&mut self) -> Result<()> {
         let sample = include_bytes!("../../assets/samples/basic.csv").to_vec();
-        self.document = Some(CsvDocument::from_bytes(sample, OpenOptions::default())?);
+        let document = CsvDocument::from_bytes(sample, OpenOptions::default())?;
+        self.delimiter = document.dialect().delimiter;
+        self.document = Some(document);
         self.selection = Selection::default();
         self.clear_history();
         Ok(())
@@ -502,16 +509,15 @@ impl EditableState {
                 BLANK_DOCUMENT_COLUMNS,
                 self.delimiter,
             ),
-            self.open_options(),
+            self.open_options(Some(self.delimiter)),
         )
     }
 
-    fn open_options(&self) -> OpenOptions {
+    fn open_options(&self, delimiter: Option<u8>) -> OpenOptions {
         OpenOptions {
             first_row_is_header: self.first_row_is_header,
             skip_rows: self.skip_rows,
-            delimiter: self.delimiter,
-            number_format: self.number_format,
+            delimiter,
         }
     }
 }
@@ -569,6 +575,43 @@ mod tests {
             .unwrap(),
         );
         state
+    }
+
+    #[test]
+    fn open_path_detects_separator_and_save_round_trips_it() {
+        let path = std::env::temp_dir().join(format!(
+            "editable-semicolon-roundtrip-{}.csv",
+            std::process::id()
+        ));
+        std::fs::write(&path, "name;amount\nAda;1,23\nGrace;4,56").unwrap();
+
+        let mut state = EditableState::default();
+        state.open_path(&path).unwrap();
+        assert_eq!(state.delimiter, b';');
+        assert_eq!(state.document.as_ref().unwrap().column_count(), 2);
+        assert_eq!(state.document.as_ref().unwrap().cell(0, 1).unwrap(), "1,23");
+
+        state.select_cell(0, 0);
+        state.set_cell("Augusta").unwrap();
+        state.save(None).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "name;amount\nAugusta;1,23\nGrace;4,56"
+        );
+
+        let mut reopened = EditableState::default();
+        reopened.open_path(&path).unwrap();
+        assert_eq!(reopened.delimiter, b';');
+        assert_eq!(
+            reopened.document.as_ref().unwrap().cell(0, 0).unwrap(),
+            "Augusta"
+        );
+        assert_eq!(
+            reopened.document.as_ref().unwrap().cell(0, 1).unwrap(),
+            "1,23"
+        );
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

@@ -4,7 +4,7 @@ mod app_state;
 mod selection;
 
 use app_state::EditableState;
-use editable_csv_core::{FilterOperator, FilterRule, NumberFormat, SortDirection, SortKey};
+use editable_csv_core::{FilterOperator, FilterRule, SortDirection, SortKey};
 use objc2::ffi::{NSInteger, NSUInteger};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, Bool, ProtocolObject, Sel};
@@ -23,8 +23,8 @@ use objc2_app_kit::{
     NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{
-    MainThreadMarker, NSLocale, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRange,
-    NSRect, NSSize, NSString, NSUserDefaults,
+    MainThreadMarker, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRange, NSRect, NSSize,
+    NSString, NSUserDefaults,
 };
 use selection::Cell;
 use std::cell::{OnceCell, RefCell};
@@ -198,8 +198,6 @@ struct FormattingPanel {
     skip_rows: Retained<NSTextField>,
     delimiter: Retained<NSPopUpButton>,
     custom_delimiter: Retained<NSTextField>,
-    grouping_separator: Retained<NSTextField>,
-    decimal_separator: Retained<NSTextField>,
     error_label: Retained<NSTextField>,
 }
 
@@ -822,7 +820,6 @@ define_class!(
                     first_row_is_header: state.first_row_is_header,
                     skip_rows: state.skip_rows,
                     delimiter: state.delimiter,
-                    number_format: state.number_format,
                 }
             };
             let result = {
@@ -830,7 +827,6 @@ define_class!(
                 state.first_row_is_header = options.first_row_is_header;
                 state.skip_rows = options.skip_rows;
                 state.delimiter = options.delimiter;
-                state.number_format = options.number_format;
                 state.reopen_with_options()
             };
             if let Err(err) = result {
@@ -839,7 +835,6 @@ define_class!(
                     state.first_row_is_header = previous.first_row_is_header;
                     state.skip_rows = previous.skip_rows;
                     state.delimiter = previous.delimiter;
-                    state.number_format = previous.number_format;
                 }
                 if let Some(panel) = self.ivars().formatting_panel.borrow().as_ref() {
                     panel
@@ -999,9 +994,7 @@ define_class!(
 impl Delegate {
     fn new(mtm: MainThreadMarker) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(AppDelegateIvars::default());
-        let this: Retained<Self> = unsafe { msg_send![super(this), init] };
-        this.ivars().state.borrow_mut().number_format = user_locale_number_format();
-        this
+        unsafe { msg_send![super(this), init] }
     }
 
     fn show_window(&self, mtm: MainThreadMarker) {
@@ -1097,7 +1090,7 @@ impl Delegate {
         let result = self.ivars().state.borrow_mut().save(target);
         let ok = result.is_ok();
         self.handle_result(result);
-        self.update_status();
+        self.refresh_table();
         ok
     }
 
@@ -1625,28 +1618,6 @@ impl Delegate {
         custom_delimiter.setHidden(delimiter_index(state.delimiter) != 5);
         content.addSubview(&custom_delimiter);
 
-        content.addSubview(&field_label("Thousands", mtm, 24.0, 100.0, 110.0));
-        let grouping_separator = NSTextField::textFieldWithString(
-            &NSString::from_str(&state.number_format.grouping_separator.to_string()),
-            mtm,
-        );
-        grouping_separator.setFrame(NSRect::new(
-            NSPoint::new(150.0, 96.0),
-            NSSize::new(92.0, 24.0),
-        ));
-        content.addSubview(&grouping_separator);
-
-        content.addSubview(&field_label("Decimals", mtm, 252.0, 100.0, 76.0));
-        let decimal_separator = NSTextField::textFieldWithString(
-            &NSString::from_str(&state.number_format.decimal_separator.to_string()),
-            mtm,
-        );
-        decimal_separator.setFrame(NSRect::new(
-            NSPoint::new(336.0, 96.0),
-            NSSize::new(92.0, 24.0),
-        ));
-        content.addSubview(&decimal_separator);
-
         let error_label = muted_label(error, mtm, 24.0, 58.0, 280.0);
         error_label.setTextColor(Some(&NSColor::systemRedColor()));
         content.addSubview(&error_label);
@@ -1681,8 +1652,6 @@ impl Delegate {
             skip_rows,
             delimiter,
             custom_delimiter,
-            grouping_separator,
-            decimal_separator,
             error_label,
         }
     }
@@ -1716,41 +1685,10 @@ impl Delegate {
                 return None;
             }
         };
-        let grouping_separator = match single_character(
-            &panel.grouping_separator.stringValue().to_string(),
-            "Thousands separator",
-        ) {
-            Ok(value) => value,
-            Err(err) => {
-                panel.error_label.setStringValue(&NSString::from_str(&err));
-                return None;
-            }
-        };
-        let decimal_separator = match single_character(
-            &panel.decimal_separator.stringValue().to_string(),
-            "Decimal separator",
-        ) {
-            Ok(value) => value,
-            Err(err) => {
-                panel.error_label.setStringValue(&NSString::from_str(&err));
-                return None;
-            }
-        };
-        if grouping_separator == decimal_separator {
-            panel.error_label.setStringValue(&NSString::from_str(
-                "Thousands and decimal separators must differ.",
-            ));
-            return None;
-        }
-
         Some(FormattingDraft {
             first_row_is_header: panel.header.state() == NSControlStateValueOn,
             skip_rows,
             delimiter,
-            number_format: NumberFormat {
-                grouping_separator,
-                decimal_separator,
-            },
         })
     }
 
@@ -2438,7 +2376,6 @@ struct FormattingDraft {
     first_row_is_header: bool,
     skip_rows: usize,
     delimiter: u8,
-    number_format: NumberFormat,
 }
 
 fn navigation_delta_for_key_code(key_code: u16) -> Option<(isize, isize)> {
@@ -2531,30 +2468,6 @@ fn launch_is_default_launch(notification: &NSNotification) -> bool {
         return true;
     };
     unsafe { msg_send![&*value, boolValue] }
-}
-
-fn user_locale_number_format() -> NumberFormat {
-    let locale = NSLocale::currentLocale();
-    let grouping_separator = locale
-        .groupingSeparator()
-        .to_string()
-        .chars()
-        .next()
-        .unwrap_or(',');
-    let decimal_separator = locale
-        .decimalSeparator()
-        .to_string()
-        .chars()
-        .next()
-        .unwrap_or('.');
-    if grouping_separator == decimal_separator {
-        NumberFormat::default()
-    } else {
-        NumberFormat {
-            grouping_separator,
-            decimal_separator,
-        }
-    }
 }
 
 fn table_hit(table: &EditableTableView, event: &NSEvent) -> Option<TableHit> {
