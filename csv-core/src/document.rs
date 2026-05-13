@@ -95,6 +95,20 @@ impl Source {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct CsvDocumentSnapshot {
+    view_rows: Vec<usize>,
+    column_order: Vec<usize>,
+    inserted_rows: Vec<Vec<String>>,
+    inserted_columns: Vec<Vec<String>>,
+    deleted_rows: HashSet<usize>,
+    deleted_columns: HashSet<usize>,
+    edits: HashMap<CellCoord, String>,
+    filters: Vec<FilterRule>,
+    sort_keys: Vec<SortKey>,
+    dirty: bool,
+}
+
 pub struct CsvDocument {
     path: Option<PathBuf>,
     source: Source,
@@ -219,6 +233,34 @@ impl CsvDocument {
             inserted_columns: self.inserted_columns.len(),
             deleted_columns: self.deleted_columns.len(),
         }
+    }
+
+    pub fn snapshot(&self) -> CsvDocumentSnapshot {
+        CsvDocumentSnapshot {
+            view_rows: self.view_rows.clone(),
+            column_order: self.column_order.clone(),
+            inserted_rows: self.inserted_rows.clone(),
+            inserted_columns: self.inserted_columns.clone(),
+            deleted_rows: self.deleted_rows.clone(),
+            deleted_columns: self.deleted_columns.clone(),
+            edits: self.edits.clone(),
+            filters: self.filters.clone(),
+            sort_keys: self.sort_keys.clone(),
+            dirty: self.dirty,
+        }
+    }
+
+    pub fn restore_snapshot(&mut self, snapshot: CsvDocumentSnapshot) {
+        self.view_rows = snapshot.view_rows;
+        self.column_order = snapshot.column_order;
+        self.inserted_rows = snapshot.inserted_rows;
+        self.inserted_columns = snapshot.inserted_columns;
+        self.deleted_rows = snapshot.deleted_rows;
+        self.deleted_columns = snapshot.deleted_columns;
+        self.edits = snapshot.edits;
+        self.filters = snapshot.filters;
+        self.sort_keys = snapshot.sort_keys;
+        self.dirty = snapshot.dirty;
     }
 
     pub fn cell(&self, row: usize, column: usize) -> Option<String> {

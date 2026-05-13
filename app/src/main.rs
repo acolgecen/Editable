@@ -72,6 +72,16 @@ define_class!(
                 owner.table_mouse_up();
             }
         }
+
+        #[unsafe(method(keyDown:))]
+        fn key_down(&self, event: &NSEvent) {
+            if self.owner().is_some_and(|owner| owner.table_key_down(event)) {
+                return;
+            }
+            unsafe {
+                let _: () = msg_send![super(self), keyDown: event];
+            }
+        }
     }
 );
 
@@ -340,12 +350,8 @@ define_class!(
                 .ivars()
                 .state
                 .borrow_mut()
-                .document
-                .as_mut()
-                .map(|doc| doc.reorder_column(column_index as usize - 1, new_column_index as usize - 1));
-            if let Some(result) = result {
-                self.handle_result(result);
-            }
+                .reorder_column(column_index as usize - 1, new_column_index as usize - 1);
+            self.handle_result(result);
             true.into()
         }
 
@@ -584,6 +590,26 @@ define_class!(
             self.refresh_table();
         }
 
+        #[unsafe(method(undoChange:))]
+        fn undo_change(&self, _sender: &AnyObject) {
+            if self.ivars().state.borrow_mut().undo() {
+                self.rebuild_columns();
+                self.refresh_table();
+            } else {
+                self.update_status();
+            }
+        }
+
+        #[unsafe(method(redoChange:))]
+        fn redo_change(&self, _sender: &AnyObject) {
+            if self.ivars().state.borrow_mut().redo() {
+                self.rebuild_columns();
+                self.refresh_table();
+            } else {
+                self.update_status();
+            }
+        }
+
         #[unsafe(method(sortDescending:))]
         fn sort_descending(&self, _sender: &AnyObject) {
             let result = self
@@ -751,14 +777,16 @@ impl Delegate {
         ));
 
         let controls = [
-            ("+ Row", sel!(addRow:), 356.0, 56.0),
-            ("+ Col", sel!(addColumn:), 416.0, 54.0),
-            ("Delete", sel!(deleteSelection:), 474.0, 60.0),
-            ("Row Up", sel!(rowUp:), 542.0, 62.0),
-            ("Row Down", sel!(rowDown:), 608.0, 76.0),
-            ("Col Left", sel!(columnLeft:), 690.0, 70.0),
-            ("Col Right", sel!(columnRight:), 768.0, 76.0),
-            ("Save", sel!(saveDocument:), 852.0, 54.0),
+            ("Undo", sel!(undoChange:), 356.0, 56.0),
+            ("Redo", sel!(redoChange:), 416.0, 56.0),
+            ("+ Row", sel!(addRow:), 488.0, 56.0),
+            ("+ Col", sel!(addColumn:), 548.0, 54.0),
+            ("Delete", sel!(deleteSelection:), 606.0, 60.0),
+            ("Row Up", sel!(rowUp:), 674.0, 62.0),
+            ("Row Down", sel!(rowDown:), 740.0, 76.0),
+            ("Col Left", sel!(columnLeft:), 822.0, 70.0),
+            ("Col Right", sel!(columnRight:), 900.0, 76.0),
+            ("Save", sel!(saveDocument:), 984.0, 54.0),
         ];
         for (title, action, x, width) in controls {
             toolbar.addSubview(&button(title, target, action, mtm, x, 10.0, width));
@@ -1345,6 +1373,31 @@ impl Delegate {
 
     fn table_mouse_up(&self) {
         self.ivars().drag_selection.replace(None);
+    }
+
+    fn table_key_down(&self, event: &NSEvent) -> bool {
+        let modifiers = event.modifierFlags();
+        if !modifiers.contains(NSEventModifierFlags::Command) {
+            return false;
+        }
+        let characters = event
+            .charactersIgnoringModifiers()
+            .map(|value| value.to_string())
+            .unwrap_or_default();
+        if !characters.eq_ignore_ascii_case("z") {
+            return false;
+        }
+
+        if modifiers.contains(NSEventModifierFlags::Shift) {
+            if self.ivars().state.borrow_mut().redo() {
+                self.rebuild_columns();
+                self.refresh_table();
+            }
+        } else if self.ivars().state.borrow_mut().undo() {
+            self.rebuild_columns();
+            self.refresh_table();
+        }
+        true
     }
 
     fn handle_result(&self, result: editable_csv_core::Result<()>) {

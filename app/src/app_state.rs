@@ -1,8 +1,18 @@
 use crate::selection::{Cell, Selection};
 use editable_csv_core::{
-    ColumnFilter, CsvDocument, FilterRule, OpenOptions, Result, SortDirection, SortKey,
+    ColumnFilter, CsvDocument, CsvDocumentSnapshot, FilterRule, OpenOptions, Result, SortDirection,
+    SortKey,
 };
 use std::path::{Path, PathBuf};
+
+const MAX_UNDO_HISTORY: usize = 10;
+
+#[derive(Clone, PartialEq, Eq)]
+struct HistoryEntry {
+    document: CsvDocumentSnapshot,
+    selection: Selection,
+    filter_text: String,
+}
 
 pub struct EditableState {
     pub document: Option<CsvDocument>,
@@ -11,6 +21,8 @@ pub struct EditableState {
     pub skip_rows: usize,
     pub filter_text: String,
     pub last_error: Option<String>,
+    undo_stack: Vec<HistoryEntry>,
+    redo_stack: Vec<HistoryEntry>,
 }
 
 impl Default for EditableState {
@@ -22,6 +34,8 @@ impl Default for EditableState {
             skip_rows: 0,
             filter_text: String::new(),
             last_error: None,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
         }
     }
 }
@@ -39,6 +53,7 @@ impl EditableState {
         self.document = Some(document);
         self.selection = Selection::default();
         self.last_error = None;
+        self.clear_history();
         Ok(())
     }
 
@@ -59,6 +74,7 @@ impl EditableState {
             )?);
             self.selection = Selection::default();
             self.last_error = None;
+            self.clear_history();
             Ok(())
         }
     }
@@ -67,6 +83,7 @@ impl EditableState {
         let sample = include_bytes!("../../assets/samples/basic.csv").to_vec();
         self.document = Some(CsvDocument::from_bytes(sample, OpenOptions::default())?);
         self.selection = Selection::default();
+        self.clear_history();
         Ok(())
     }
 
@@ -153,63 +170,74 @@ impl EditableState {
     }
 
     pub fn set_cell(&mut self, value: impl Into<String>) -> Result<()> {
-        let active = self.selection.active_cell();
-        if let Some(doc) = &mut self.document {
-            doc.set_cell(active.row, active.column, value)?;
-        }
-        Ok(())
+        let value = value.into();
+        self.record_undoable(move |state| {
+            let active = state.selection.active_cell();
+            if let Some(doc) = &mut state.document {
+                doc.set_cell(active.row, active.column, value)?;
+            }
+            Ok(())
+        })
     }
 
     pub fn insert_row(&mut self) -> Result<()> {
-        let row = self.selection.active_cell().row;
-        if let Some(doc) = &mut self.document {
-            doc.insert_row(row)?;
-        }
-        Ok(())
+        self.record_undoable(|state| {
+            let row = state.selection.active_cell().row;
+            if let Some(doc) = &mut state.document {
+                doc.insert_row(row)?;
+            }
+            Ok(())
+        })
     }
 
     pub fn insert_column(&mut self) -> Result<()> {
-        let column = self.selection.active_cell().column;
-        if let Some(doc) = &mut self.document {
-            doc.insert_column(column)?;
-        }
-        Ok(())
+        self.record_undoable(|state| {
+            let column = state.selection.active_cell().column;
+            if let Some(doc) = &mut state.document {
+                doc.insert_column(column)?;
+            }
+            Ok(())
+        })
     }
 
     pub fn delete_selection(&mut self) -> Result<()> {
-        if let Some(doc) = &mut self.document {
-            match self.selection.clone() {
-                Selection::Row { anchor, focus } => {
-                    for row in (anchor.min(focus)..=anchor.max(focus)).rev() {
-                        doc.delete_row(row)?;
+        self.record_undoable(|state| {
+            if let Some(doc) = &mut state.document {
+                match state.selection.clone() {
+                    Selection::Row { anchor, focus } => {
+                        for row in (anchor.min(focus)..=anchor.max(focus)).rev() {
+                            doc.delete_row(row)?;
+                        }
                     }
-                }
-                Selection::Column { anchor, focus } => {
-                    for column in (anchor.min(focus)..=anchor.max(focus)).rev() {
-                        doc.delete_column(column)?;
+                    Selection::Column { anchor, focus } => {
+                        for column in (anchor.min(focus)..=anchor.max(focus)).rev() {
+                            doc.delete_column(column)?;
+                        }
                     }
-                }
-                Selection::Cells { .. } | Selection::Cell(_) => {
-                    for cell in self.selection.cells() {
-                        doc.set_cell(cell.row, cell.column, "")?;
+                    Selection::Cells { .. } | Selection::Cell(_) => {
+                        for cell in state.selection.cells() {
+                            doc.set_cell(cell.row, cell.column, "")?;
+                        }
                     }
-                }
-                Selection::All => {
-                    for row in (0..doc.row_count()).rev() {
-                        doc.delete_row(row)?;
+                    Selection::All => {
+                        for row in (0..doc.row_count()).rev() {
+                            doc.delete_row(row)?;
+                        }
                     }
                 }
             }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     pub fn sort_active_column(&mut self, direction: SortDirection) -> Result<()> {
-        let column = self.selection.active_cell().column;
-        if let Some(doc) = &mut self.document {
-            doc.sort_by(vec![SortKey { column, direction }])?;
-        }
-        Ok(())
+        self.record_undoable(|state| {
+            let column = state.selection.active_cell().column;
+            if let Some(doc) = &mut state.document {
+                doc.sort_by(vec![SortKey { column, direction }])?;
+            }
+            Ok(())
+        })
     }
 
     pub fn sort_keys(&self) -> Vec<SortKey> {
@@ -231,56 +259,73 @@ impl EditableState {
         sort_keys: Vec<SortKey>,
         filter_rules: Vec<FilterRule>,
     ) -> Result<()> {
-        if let Some(doc) = &mut self.document {
-            doc.set_filter_rules(filter_rules)?;
-            doc.sort_by(sort_keys)?;
-        }
-        self.filter_text.clear();
-        Ok(())
+        self.record_undoable(move |state| {
+            if let Some(doc) = &mut state.document {
+                doc.set_filter_rules(filter_rules)?;
+                doc.sort_by(sort_keys)?;
+            }
+            state.filter_text.clear();
+            Ok(())
+        })
     }
 
     pub fn filter_active_column_contains(&mut self, needle: String) -> Result<()> {
-        let column = self.selection.active_cell().column;
-        self.filter_text = needle.clone();
-        if let Some(doc) = &mut self.document {
-            let filter = if needle.is_empty() {
-                None
-            } else {
-                Some(ColumnFilter::Contains(needle))
-            };
-            doc.set_filter(column, filter)?;
-        }
-        Ok(())
+        self.record_undoable(move |state| {
+            let column = state.selection.active_cell().column;
+            state.filter_text = needle.clone();
+            if let Some(doc) = &mut state.document {
+                let filter = if needle.is_empty() {
+                    None
+                } else {
+                    Some(ColumnFilter::Contains(needle))
+                };
+                doc.set_filter(column, filter)?;
+            }
+            Ok(())
+        })
     }
 
     pub fn move_active_row(&mut self, delta: isize) -> Result<()> {
-        let active = self.selection.active_cell();
-        if let Some(doc) = &mut self.document {
-            let to = active
-                .row
-                .saturating_add_signed(delta)
-                .min(doc.row_count().saturating_sub(1));
-            if to != active.row {
-                doc.reorder_row(active.row, to)?;
-                self.select_cell(to, active.column);
+        self.record_undoable(|state| {
+            let active = state.selection.active_cell();
+            if let Some(doc) = &mut state.document {
+                let to = active
+                    .row
+                    .saturating_add_signed(delta)
+                    .min(doc.row_count().saturating_sub(1));
+                if to != active.row {
+                    doc.reorder_row(active.row, to)?;
+                    state.select_cell(to, active.column);
+                }
             }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     pub fn move_active_column(&mut self, delta: isize) -> Result<()> {
-        let active = self.selection.active_cell();
-        if let Some(doc) = &mut self.document {
-            let to = active
-                .column
-                .saturating_add_signed(delta)
-                .min(doc.column_count().saturating_sub(1));
-            if to != active.column {
-                doc.reorder_column(active.column, to)?;
-                self.select_cell(active.row, to);
+        self.record_undoable(|state| {
+            let active = state.selection.active_cell();
+            if let Some(doc) = &mut state.document {
+                let to = active
+                    .column
+                    .saturating_add_signed(delta)
+                    .min(doc.column_count().saturating_sub(1));
+                if to != active.column {
+                    doc.reorder_column(active.column, to)?;
+                    state.select_cell(active.row, to);
+                }
             }
-        }
-        Ok(())
+            Ok(())
+        })
+    }
+
+    pub fn reorder_column(&mut self, from: usize, to: usize) -> Result<()> {
+        self.record_undoable(|state| {
+            if let Some(doc) = &mut state.document {
+                doc.reorder_column(from, to)?;
+            }
+            Ok(())
+        })
     }
 
     pub fn move_selection(&mut self, rows: isize, columns: isize, extending: bool) {
@@ -364,7 +409,84 @@ impl EditableState {
             .or_else(|| doc.path().map(Path::to_path_buf))
             .unwrap_or_else(|| PathBuf::from("Editable.csv"));
         doc.save_to(path)?;
+        self.clear_history();
         Ok(())
+    }
+
+    pub fn undo(&mut self) -> bool {
+        let Some(entry) = self.undo_stack.pop() else {
+            return false;
+        };
+        if let Some(current) = self.history_snapshot() {
+            self.redo_stack.push(current);
+        }
+        self.restore_history_entry(entry);
+        true
+    }
+
+    pub fn redo(&mut self) -> bool {
+        let Some(entry) = self.redo_stack.pop() else {
+            return false;
+        };
+        if let Some(current) = self.history_snapshot() {
+            self.push_undo(current);
+        }
+        self.restore_history_entry(entry);
+        true
+    }
+
+    pub fn can_undo(&self) -> bool {
+        !self.undo_stack.is_empty()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        !self.redo_stack.is_empty()
+    }
+
+    fn record_undoable(&mut self, change: impl FnOnce(&mut Self) -> Result<()>) -> Result<()> {
+        let Some(before) = self.history_snapshot() else {
+            return change(self);
+        };
+
+        if let Err(err) = change(self) {
+            self.restore_history_entry(before);
+            return Err(err);
+        }
+
+        if self.history_snapshot().is_some_and(|after| after != before) {
+            self.push_undo(before);
+            self.redo_stack.clear();
+        }
+        Ok(())
+    }
+
+    fn history_snapshot(&self) -> Option<HistoryEntry> {
+        self.document.as_ref().map(|document| HistoryEntry {
+            document: document.snapshot(),
+            selection: self.selection.clone(),
+            filter_text: self.filter_text.clone(),
+        })
+    }
+
+    fn restore_history_entry(&mut self, entry: HistoryEntry) {
+        if let Some(document) = &mut self.document {
+            document.restore_snapshot(entry.document);
+            self.selection = entry.selection;
+            self.filter_text = entry.filter_text;
+            self.last_error = None;
+        }
+    }
+
+    fn push_undo(&mut self, entry: HistoryEntry) {
+        if self.undo_stack.len() == MAX_UNDO_HISTORY {
+            self.undo_stack.remove(0);
+        }
+        self.undo_stack.push(entry);
+    }
+
+    fn clear_history(&mut self) {
+        self.undo_stack.clear();
+        self.redo_stack.clear();
     }
 }
 
@@ -395,4 +517,84 @@ fn spreadsheet_column_name(mut column: usize) -> String {
         column = column / 26 - 1;
     }
     name
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state_with_sample() -> EditableState {
+        let mut state = EditableState::default();
+        state.document = Some(
+            CsvDocument::from_bytes(
+                b"name,age\nAda,36\nGrace,85\nAlan,41\n".to_vec(),
+                OpenOptions::default(),
+            )
+            .unwrap(),
+        );
+        state
+    }
+
+    #[test]
+    fn undo_and_redo_cell_edit() {
+        let mut state = state_with_sample();
+        state.select_cell(0, 0);
+
+        state.set_cell("Augusta").unwrap();
+        assert_eq!(
+            state.document.as_ref().unwrap().cell(0, 0).unwrap(),
+            "Augusta"
+        );
+        assert!(state.can_undo());
+        assert!(!state.can_redo());
+
+        assert!(state.undo());
+        assert_eq!(state.document.as_ref().unwrap().cell(0, 0).unwrap(), "Ada");
+        assert!(state.can_redo());
+
+        assert!(state.redo());
+        assert_eq!(
+            state.document.as_ref().unwrap().cell(0, 0).unwrap(),
+            "Augusta"
+        );
+    }
+
+    #[test]
+    fn undo_history_is_capped_at_ten_entries() {
+        let mut state = state_with_sample();
+        state.select_cell(0, 0);
+
+        for idx in 0..12 {
+            state.set_cell(format!("name-{idx}")).unwrap();
+        }
+
+        let mut undos = 0;
+        while state.undo() {
+            undos += 1;
+        }
+
+        assert_eq!(undos, 10);
+        assert_eq!(
+            state.document.as_ref().unwrap().cell(0, 0).unwrap(),
+            "name-1"
+        );
+    }
+
+    #[test]
+    fn new_edit_after_undo_clears_redo() {
+        let mut state = state_with_sample();
+        state.select_cell(0, 0);
+
+        state.set_cell("first").unwrap();
+        state.set_cell("second").unwrap();
+        assert!(state.undo());
+        assert!(state.can_redo());
+
+        state.set_cell("third").unwrap();
+        assert!(!state.can_redo());
+        assert_eq!(
+            state.document.as_ref().unwrap().cell(0, 0).unwrap(),
+            "third"
+        );
+    }
 }
