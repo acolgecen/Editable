@@ -14,11 +14,11 @@ use objc2_app_kit::{
     NSAlertThirdButtonReturn, NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate,
     NSAutoresizingMaskOptions, NSBackingStoreType, NSBorderType, NSButton, NSButtonType, NSColor,
     NSControlStateValueOff, NSControlStateValueOn, NSControlTextEditingDelegate, NSEvent,
-    NSEventModifierFlags, NSFont, NSModalResponseCancel, NSModalResponseOK, NSOpenPanel,
-    NSPopUpButton, NSScrollView, NSTableColumn, NSTableView, NSTableViewColumnAutoresizingStyle,
-    NSTableViewDataSource, NSTableViewDelegate, NSTableViewGridLineStyle,
-    NSTableViewSelectionHighlightStyle, NSTextAlignment, NSTextField, NSTextFieldCell, NSView,
-    NSWindow, NSWindowDelegate, NSWindowStyleMask,
+    NSEventModifierFlags, NSFont, NSMenu, NSMenuItem, NSModalResponseCancel, NSModalResponseOK,
+    NSOpenPanel, NSPopUpButton, NSSavePanel, NSScrollView, NSTableColumn, NSTableView,
+    NSTableViewColumnAutoresizingStyle, NSTableViewDataSource, NSTableViewDelegate,
+    NSTableViewGridLineStyle, NSTableViewSelectionHighlightStyle, NSTextAlignment, NSTextField,
+    NSTextFieldCell, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{
     MainThreadMarker, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize,
@@ -132,6 +132,7 @@ struct SortFilterPanel {
 #[derive(Default)]
 struct AppDelegateIvars {
     window: OnceCell<Retained<NSWindow>>,
+    window_delegates: RefCell<Vec<Retained<Delegate>>>,
     table: OnceCell<Retained<EditableTableView>>,
     status: OnceCell<Retained<NSTextField>>,
     header_checkbox: OnceCell<Retained<NSButton>>,
@@ -170,6 +171,7 @@ define_class!(
             app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
             #[allow(deprecated)]
             app.activateIgnoringOtherApps(true);
+            self.install_main_menu(&app);
 
             {
                 let mut state = self.ivars().state.borrow_mut();
@@ -179,67 +181,25 @@ define_class!(
                     if let Err(err) = state.open_path(path) {
                         state.last_error = Some(err.to_string());
                     }
-                } else if let Some(path) = choose_startup_file(mtm) {
-                    if let Err(err) = state.open_path(path) {
+                } else {
+                    if let Err(err) = state.open_blank() {
                         state.last_error = Some(err.to_string());
                     }
-                } else {
-                    app.terminate(None);
-                    return;
                 }
             }
 
-            let window = unsafe {
-                NSWindow::initWithContentRect_styleMask_backing_defer(
-                    NSWindow::alloc(mtm),
-                    NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1120.0, 740.0)),
-                    NSWindowStyleMask::Titled
-                        | NSWindowStyleMask::Closable
-                        | NSWindowStyleMask::Miniaturizable
-                        | NSWindowStyleMask::Resizable,
-                    NSBackingStoreType::Buffered,
-                    false,
-                )
-            };
-            unsafe { window.setReleasedWhenClosed(false) };
-            window.setTitle(&NSString::from_str(&self.ivars().state.borrow().title()));
-            window.setContentMinSize(NSSize::new(860.0, 520.0));
-
-            let content = window.contentView().expect("window must have a content view");
-            let toolbar = self.make_toolbar(mtm);
-            let status = self.make_status(mtm);
-            let scroll = self.make_table_area(mtm);
-            content.addSubview(&toolbar);
-            content.addSubview(&scroll);
-            content.addSubview(&status);
-
-            window.center();
-            window.setDelegate(Some(ProtocolObject::from_ref(self)));
-            window.makeKeyAndOrderFront(None);
-
-            self.ivars().window.set(window).ok();
-            self.rebuild_columns();
-            self.refresh_table();
-
+            self.show_window(mtm);
         }
 
         #[unsafe(method(applicationShouldTerminateAfterLastWindowClosed:))]
         fn should_terminate_after_last_window_closed(&self, _app: &NSApplication) -> bool {
-            true
+            false
         }
 
         #[unsafe(method(application:openFile:))]
         fn open_file(&self, _sender: &NSApplication, filename: &NSString) -> Bool {
-            let result = self
-                .ivars()
-                .state
-                .borrow_mut()
-                .open_path(PathBuf::from(filename.to_string()));
-            let ok = result.is_ok();
-            self.handle_result(result);
-            self.rebuild_columns();
-            self.refresh_table();
-            ok.into()
+            self.open_window_for_path(PathBuf::from(filename.to_string()))
+                .into()
         }
     }
 
@@ -416,13 +376,7 @@ define_class!(
             }
 
             let should_close = match self.confirm_close_with_unsaved_changes() {
-                CloseChoice::Save => {
-                    let result = self.ivars().state.borrow_mut().save(None);
-                    let should_close = result.is_ok();
-                    self.handle_result(result);
-                    self.update_status();
-                    should_close
-                }
+                CloseChoice::Save => self.save_document_with_prompt(),
                 CloseChoice::Discard => true,
                 CloseChoice::Cancel => false,
             };
@@ -431,23 +385,189 @@ define_class!(
 
         #[unsafe(method(windowWillClose:))]
         fn window_will_close(&self, _notification: &NSNotification) {
-            NSApplication::sharedApplication(self.mtm()).terminate(None);
+            self.ivars().sort_filter_panel.replace(None);
         }
     }
 
     impl Delegate {
+        #[unsafe(method(menuOpenDocument:))]
+        fn menu_open_document(&self, _sender: &AnyObject) {
+            if let Some(path) = choose_startup_file(self.mtm()) {
+                self.open_window_for_path(path);
+            }
+        }
+
+        #[unsafe(method(menuSaveDocument:))]
+        fn menu_save_document(&self, sender: &AnyObject) {
+            self.with_active_window_delegate(|delegate| delegate.save_document(sel!(saveDocument:), sender));
+        }
+
+        #[unsafe(method(menuCloseWindow:))]
+        fn menu_close_window(&self, sender: &AnyObject) {
+            if let Some(window) = NSApplication::sharedApplication(self.mtm()).keyWindow() {
+                window.performClose(Some(sender));
+            }
+        }
+
+        #[unsafe(method(menuMinimizeWindow:))]
+        fn menu_minimize_window(&self, sender: &AnyObject) {
+            if let Some(window) = NSApplication::sharedApplication(self.mtm()).keyWindow() {
+                window.miniaturize(Some(sender));
+            }
+        }
+
+        #[unsafe(method(menuUndoChange:))]
+        fn menu_undo_change(&self, sender: &AnyObject) {
+            self.with_active_window_delegate(|delegate| delegate.undo_change(sel!(undoChange:), sender));
+        }
+
+        #[unsafe(method(menuRedoChange:))]
+        fn menu_redo_change(&self, sender: &AnyObject) {
+            self.with_active_window_delegate(|delegate| delegate.redo_change(sel!(redoChange:), sender));
+        }
+
+        #[unsafe(method(menuToggleHeader:))]
+        fn menu_toggle_header(&self, sender: &AnyObject) {
+            self.with_active_window_delegate(|delegate| delegate.toggle_header(sel!(toggleHeader:), sender));
+        }
+
+        #[unsafe(method(menuSetSkipRows:))]
+        fn menu_set_skip_rows(&self, sender: &AnyObject) {
+            self.with_active_window_delegate(|delegate| {
+                delegate.set_skip_rows_from_menu(sel!(setSkipRowsFromMenu:), sender)
+            });
+        }
+
+        #[unsafe(method(menuOpenSortFilter:))]
+        fn menu_open_sort_filter(&self, sender: &AnyObject) {
+            self.with_active_window_delegate(|delegate| {
+                delegate.open_sort_filter(sel!(openSortFilter:), sender)
+            });
+        }
+
+        #[unsafe(method(menuSortAscending:))]
+        fn menu_sort_ascending(&self, sender: &AnyObject) {
+            self.with_active_window_delegate(|delegate| {
+                delegate.sort_ascending(sel!(sortAscending:), sender)
+            });
+        }
+
+        #[unsafe(method(menuSortDescending:))]
+        fn menu_sort_descending(&self, sender: &AnyObject) {
+            self.with_active_window_delegate(|delegate| {
+                delegate.sort_descending(sel!(sortDescending:), sender)
+            });
+        }
+
+        #[unsafe(method(menuAddRow:))]
+        fn menu_add_row(&self, sender: &AnyObject) {
+            self.with_active_window_delegate(|delegate| delegate.add_row(sel!(addRow:), sender));
+        }
+
+        #[unsafe(method(menuAddColumn:))]
+        fn menu_add_column(&self, sender: &AnyObject) {
+            self.with_active_window_delegate(|delegate| delegate.add_column(sel!(addColumn:), sender));
+        }
+
+        #[unsafe(method(menuDeleteSelection:))]
+        fn menu_delete_selection(&self, sender: &AnyObject) {
+            self.with_active_window_delegate(|delegate| {
+                delegate.delete_selection(sel!(deleteSelection:), sender)
+            });
+        }
+
+        #[unsafe(method(menuMoveRowUp:))]
+        fn menu_move_row_up(&self, sender: &AnyObject) {
+            self.with_active_window_delegate(|delegate| delegate.row_up(sel!(rowUp:), sender));
+        }
+
+        #[unsafe(method(menuMoveRowDown:))]
+        fn menu_move_row_down(&self, sender: &AnyObject) {
+            self.with_active_window_delegate(|delegate| delegate.row_down(sel!(rowDown:), sender));
+        }
+
+        #[unsafe(method(menuMoveColumnLeft:))]
+        fn menu_move_column_left(&self, sender: &AnyObject) {
+            self.with_active_window_delegate(|delegate| delegate.column_left(sel!(columnLeft:), sender));
+        }
+
+        #[unsafe(method(menuMoveColumnRight:))]
+        fn menu_move_column_right(&self, sender: &AnyObject) {
+            self.with_active_window_delegate(|delegate| {
+                delegate.column_right(sel!(columnRight:), sender)
+            });
+        }
+
+        #[unsafe(method(menuEditSelectedCell:))]
+        fn menu_edit_selected_cell(&self, sender: &AnyObject) {
+            self.with_active_window_delegate(|delegate| {
+                delegate.edit_selected_cell(sel!(editSelectedCell:), sender)
+            });
+        }
+
         #[unsafe(method(toggleHeader:))]
         fn toggle_header(&self, sender: &AnyObject) {
             let checked = sender
                 .downcast_ref::<NSButton>()
                 .map(|button| button.state() == NSControlStateValueOn)
-                .unwrap_or(true);
+                .unwrap_or_else(|| !self.ivars().state.borrow().first_row_is_header);
             let result = {
                 let mut state = self.ivars().state.borrow_mut();
                 state.first_row_is_header = checked;
                 state.reopen_with_options()
             };
             self.handle_result(result);
+            if let Some(header) = self.ivars().header_checkbox.get() {
+                header.setState(if checked {
+                    NSControlStateValueOn
+                } else {
+                    NSControlStateValueOff
+                });
+            }
+            self.rebuild_columns();
+            self.refresh_table();
+        }
+
+        #[unsafe(method(setSkipRowsFromMenu:))]
+        fn set_skip_rows_from_menu(&self, _sender: &AnyObject) {
+            let mtm = self.mtm();
+            let alert = NSAlert::new(mtm);
+            alert.setMessageText(&NSString::from_str("Set Skip Rows"));
+            alert.setInformativeText(&NSString::from_str(
+                "Choose how many rows to ignore before reading the CSV data.",
+            ));
+            alert.addButtonWithTitle(&NSString::from_str("Apply"));
+            alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+
+            let field = NSTextField::textFieldWithString(
+                &NSString::from_str(&self.ivars().state.borrow().skip_rows.to_string()),
+                mtm,
+            );
+            field.setFrame(NSRect::new(
+                NSPoint::new(0.0, 0.0),
+                NSSize::new(180.0, 24.0),
+            ));
+            alert.setAccessoryView(Some(&field));
+
+            if alert.runModal() != NSAlertFirstButtonReturn {
+                return;
+            }
+
+            let value = field
+                .stringValue()
+                .to_string()
+                .trim()
+                .parse::<usize>()
+                .unwrap_or(0);
+            let result = {
+                let mut state = self.ivars().state.borrow_mut();
+                state.skip_rows = value;
+                state.reopen_with_options()
+            };
+            self.handle_result(result);
+            if let Some(skip_field) = self.ivars().skip_field.get() {
+                skip_field.setStringValue(&NSString::from_str(&value.to_string()));
+            }
             self.rebuild_columns();
             self.refresh_table();
         }
@@ -680,9 +800,7 @@ define_class!(
 
         #[unsafe(method(saveDocument:))]
         fn save_document(&self, _sender: &AnyObject) {
-            let result = self.ivars().state.borrow_mut().save(None);
-            self.handle_result(result);
-            self.update_status();
+            self.save_document_with_prompt();
         }
 
         #[unsafe(method(editClickedCell:))]
@@ -709,6 +827,26 @@ define_class!(
                 table.editColumn_row_withEvent_select(column as NSInteger, row, None, true);
             }
         }
+
+        #[unsafe(method(editSelectedCell:))]
+        fn edit_selected_cell(&self, _sender: &AnyObject) {
+            let Some(table) = self.ivars().table.get() else {
+                return;
+            };
+            let active = self.ivars().state.borrow().selection.active_cell();
+            let table_column = active.column + 1;
+            if table.numberOfRows() <= active.row as NSInteger
+                || table.numberOfColumns() <= table_column as NSInteger
+            {
+                return;
+            }
+            table.editColumn_row_withEvent_select(
+                table_column as NSInteger,
+                active.row as NSInteger,
+                None,
+                true,
+            );
+        }
     }
 );
 
@@ -716,6 +854,373 @@ impl Delegate {
     fn new(mtm: MainThreadMarker) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(AppDelegateIvars::default());
         unsafe { msg_send![super(this), init] }
+    }
+
+    fn show_window(&self, mtm: MainThreadMarker) {
+        if let Some(window) = self.ivars().window.get() {
+            window.makeKeyAndOrderFront(None);
+            return;
+        }
+
+        let window = unsafe {
+            NSWindow::initWithContentRect_styleMask_backing_defer(
+                NSWindow::alloc(mtm),
+                NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1120.0, 740.0)),
+                NSWindowStyleMask::Titled
+                    | NSWindowStyleMask::Closable
+                    | NSWindowStyleMask::Miniaturizable
+                    | NSWindowStyleMask::Resizable,
+                NSBackingStoreType::Buffered,
+                false,
+            )
+        };
+        unsafe { window.setReleasedWhenClosed(false) };
+        window.setTitle(&NSString::from_str(&self.ivars().state.borrow().title()));
+        window.setContentMinSize(NSSize::new(860.0, 520.0));
+
+        let content = window
+            .contentView()
+            .expect("window must have a content view");
+        let toolbar = self.make_toolbar(mtm);
+        let status = self.make_status(mtm);
+        let scroll = self.make_table_area(mtm);
+        content.addSubview(&toolbar);
+        content.addSubview(&scroll);
+        content.addSubview(&status);
+
+        window.center();
+        window.setDelegate(Some(ProtocolObject::from_ref(self)));
+        window.makeKeyAndOrderFront(None);
+
+        self.ivars().window.set(window).ok();
+        self.rebuild_columns();
+        self.refresh_table();
+    }
+
+    fn open_window_for_path(&self, path: PathBuf) -> bool {
+        let mtm = self.mtm();
+        let delegate = Delegate::new(mtm);
+        let result = delegate.ivars().state.borrow_mut().open_path(path);
+        if result.is_err() {
+            delegate.handle_result(result);
+            return false;
+        }
+        delegate.show_window(mtm);
+        self.ivars().window_delegates.borrow_mut().push(delegate);
+        true
+    }
+
+    fn save_document_with_prompt(&self) -> bool {
+        let target = {
+            let state = self.ivars().state.borrow();
+            let Some(doc) = state.document.as_ref() else {
+                return true;
+            };
+            if doc.path().is_some() {
+                None
+            } else {
+                Some(match choose_save_target(self.mtm(), &state.title()) {
+                    Some(path) => path,
+                    None => return false,
+                })
+            }
+        };
+
+        let result = self.ivars().state.borrow_mut().save(target);
+        let ok = result.is_ok();
+        self.handle_result(result);
+        self.update_status();
+        ok
+    }
+
+    fn with_active_window_delegate(&self, action: impl FnOnce(&Delegate)) -> bool {
+        let app = NSApplication::sharedApplication(self.mtm());
+        if let Some(key_window) = app.keyWindow() {
+            if window_delegate_matches(self, &key_window) {
+                action(self);
+                return true;
+            }
+
+            let target = self
+                .ivars()
+                .window_delegates
+                .borrow()
+                .iter()
+                .find(|delegate| window_delegate_matches(delegate, &key_window))
+                .cloned();
+            if let Some(delegate) = target {
+                action(&delegate);
+                return true;
+            }
+        }
+
+        if let Some(main_window) = app.mainWindow() {
+            if window_delegate_matches(self, &main_window) {
+                action(self);
+                return true;
+            }
+
+            let target = self
+                .ivars()
+                .window_delegates
+                .borrow()
+                .iter()
+                .find(|delegate| window_delegate_matches(delegate, &main_window))
+                .cloned();
+            if let Some(delegate) = target {
+                action(&delegate);
+                return true;
+            }
+        }
+
+        if window_delegate_is_visible(self) {
+            action(self);
+            return true;
+        }
+
+        let target = self
+            .ivars()
+            .window_delegates
+            .borrow()
+            .iter()
+            .find(|delegate| window_delegate_is_visible(delegate))
+            .cloned();
+        if let Some(delegate) = target {
+            action(&delegate);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn install_main_menu(&self, app: &NSApplication) {
+        let mtm = self.mtm();
+        let app_target = unsafe { any_ref(app) };
+        let delegate_target = unsafe { any_ref(self) };
+        let main_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str(""));
+
+        let app_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str("Editable"));
+        app_menu.addItem(&menu_item(
+            "About Editable",
+            app_target,
+            Some(sel!(orderFrontStandardAboutPanel:)),
+            "",
+            NSEventModifierFlags::empty(),
+            mtm,
+        ));
+        add_separator(&app_menu, mtm);
+        app_menu.addItem(&menu_item(
+            "Hide Editable",
+            app_target,
+            Some(sel!(hide:)),
+            "h",
+            NSEventModifierFlags::Command,
+            mtm,
+        ));
+        app_menu.addItem(&menu_item(
+            "Hide Others",
+            app_target,
+            Some(sel!(hideOtherApplications:)),
+            "h",
+            NSEventModifierFlags::Command | NSEventModifierFlags::Option,
+            mtm,
+        ));
+        app_menu.addItem(&menu_item(
+            "Show All",
+            app_target,
+            Some(sel!(unhideAllApplications:)),
+            "",
+            NSEventModifierFlags::empty(),
+            mtm,
+        ));
+        add_separator(&app_menu, mtm);
+        app_menu.addItem(&menu_item(
+            "Quit Editable",
+            app_target,
+            Some(sel!(terminate:)),
+            "q",
+            NSEventModifierFlags::Command,
+            mtm,
+        ));
+        add_submenu(&main_menu, "Editable", &app_menu, mtm);
+
+        let file_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str("File"));
+        file_menu.addItem(&menu_item(
+            "Open...",
+            delegate_target,
+            Some(sel!(menuOpenDocument:)),
+            "o",
+            NSEventModifierFlags::Command,
+            mtm,
+        ));
+        file_menu.addItem(&menu_item(
+            "Save",
+            delegate_target,
+            Some(sel!(menuSaveDocument:)),
+            "s",
+            NSEventModifierFlags::Command,
+            mtm,
+        ));
+        add_separator(&file_menu, mtm);
+        file_menu.addItem(&menu_item(
+            "Close Window",
+            delegate_target,
+            Some(sel!(menuCloseWindow:)),
+            "w",
+            NSEventModifierFlags::Command,
+            mtm,
+        ));
+        add_submenu(&main_menu, "File", &file_menu, mtm);
+
+        let edit_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str("Edit"));
+        edit_menu.addItem(&menu_item(
+            "Undo",
+            delegate_target,
+            Some(sel!(menuUndoChange:)),
+            "z",
+            NSEventModifierFlags::Command,
+            mtm,
+        ));
+        edit_menu.addItem(&menu_item(
+            "Redo",
+            delegate_target,
+            Some(sel!(menuRedoChange:)),
+            "z",
+            NSEventModifierFlags::Command | NSEventModifierFlags::Shift,
+            mtm,
+        ));
+        add_separator(&edit_menu, mtm);
+        edit_menu.addItem(&menu_item(
+            "Edit Cell",
+            delegate_target,
+            Some(sel!(menuEditSelectedCell:)),
+            "e",
+            NSEventModifierFlags::Command,
+            mtm,
+        ));
+        edit_menu.addItem(&menu_item(
+            "Delete Selection",
+            delegate_target,
+            Some(sel!(menuDeleteSelection:)),
+            "",
+            NSEventModifierFlags::empty(),
+            mtm,
+        ));
+        add_submenu(&main_menu, "Edit", &edit_menu, mtm);
+
+        let table_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str("Table"));
+        table_menu.addItem(&menu_item(
+            "Toggle Header Row",
+            delegate_target,
+            Some(sel!(menuToggleHeader:)),
+            "",
+            NSEventModifierFlags::empty(),
+            mtm,
+        ));
+        table_menu.addItem(&menu_item(
+            "Set Skip Rows...",
+            delegate_target,
+            Some(sel!(menuSetSkipRows:)),
+            "",
+            NSEventModifierFlags::empty(),
+            mtm,
+        ));
+        table_menu.addItem(&menu_item(
+            "Sort and Filter...",
+            delegate_target,
+            Some(sel!(menuOpenSortFilter:)),
+            "f",
+            NSEventModifierFlags::Command | NSEventModifierFlags::Option,
+            mtm,
+        ));
+        table_menu.addItem(&menu_item(
+            "Sort Ascending",
+            delegate_target,
+            Some(sel!(menuSortAscending:)),
+            "",
+            NSEventModifierFlags::empty(),
+            mtm,
+        ));
+        table_menu.addItem(&menu_item(
+            "Sort Descending",
+            delegate_target,
+            Some(sel!(menuSortDescending:)),
+            "",
+            NSEventModifierFlags::empty(),
+            mtm,
+        ));
+        add_separator(&table_menu, mtm);
+        table_menu.addItem(&menu_item(
+            "Add Row",
+            delegate_target,
+            Some(sel!(menuAddRow:)),
+            "",
+            NSEventModifierFlags::empty(),
+            mtm,
+        ));
+        table_menu.addItem(&menu_item(
+            "Add Column",
+            delegate_target,
+            Some(sel!(menuAddColumn:)),
+            "",
+            NSEventModifierFlags::empty(),
+            mtm,
+        ));
+        table_menu.addItem(&menu_item(
+            "Move Row Up",
+            delegate_target,
+            Some(sel!(menuMoveRowUp:)),
+            "",
+            NSEventModifierFlags::empty(),
+            mtm,
+        ));
+        table_menu.addItem(&menu_item(
+            "Move Row Down",
+            delegate_target,
+            Some(sel!(menuMoveRowDown:)),
+            "",
+            NSEventModifierFlags::empty(),
+            mtm,
+        ));
+        table_menu.addItem(&menu_item(
+            "Move Column Left",
+            delegate_target,
+            Some(sel!(menuMoveColumnLeft:)),
+            "",
+            NSEventModifierFlags::empty(),
+            mtm,
+        ));
+        table_menu.addItem(&menu_item(
+            "Move Column Right",
+            delegate_target,
+            Some(sel!(menuMoveColumnRight:)),
+            "",
+            NSEventModifierFlags::empty(),
+            mtm,
+        ));
+        add_submenu(&main_menu, "Table", &table_menu, mtm);
+
+        let window_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str("Window"));
+        window_menu.addItem(&menu_item(
+            "Minimize",
+            delegate_target,
+            Some(sel!(menuMinimizeWindow:)),
+            "m",
+            NSEventModifierFlags::Command,
+            mtm,
+        ));
+        window_menu.addItem(&menu_item(
+            "Bring All to Front",
+            app_target,
+            Some(sel!(arrangeInFront:)),
+            "",
+            NSEventModifierFlags::empty(),
+            mtm,
+        ));
+        add_submenu(&main_menu, "Window", &window_menu, mtm);
+
+        app.setWindowsMenu(Some(&window_menu));
+        app.setMainMenu(Some(&main_menu));
     }
 
     fn make_toolbar(&self, mtm: MainThreadMarker) -> Retained<objc2_app_kit::NSView> {
@@ -1554,6 +2059,23 @@ fn choose_startup_file(mtm: MainThreadMarker) -> Option<PathBuf> {
     }
 }
 
+fn choose_save_target(mtm: MainThreadMarker, filename: &str) -> Option<PathBuf> {
+    let panel = NSSavePanel::savePanel(mtm);
+    panel.setCanCreateDirectories(true);
+    panel.setTitle(Some(&NSString::from_str("Save CSV")));
+    panel.setMessage(Some(&NSString::from_str(
+        "Choose where to save this CSV file.",
+    )));
+    panel.setPrompt(Some(&NSString::from_str("Save")));
+    panel.setNameFieldStringValue(&NSString::from_str(filename));
+
+    if panel.runModal() == NSModalResponseOK {
+        panel.URL().and_then(|url| url.to_file_path())
+    } else {
+        None
+    }
+}
+
 fn button(
     title: &str,
     target: &AnyObject,
@@ -1573,6 +2095,60 @@ fn button(
     };
     button.setFrame(NSRect::new(NSPoint::new(x, y), NSSize::new(width, 24.0)));
     button
+}
+
+fn menu_item(
+    title: &str,
+    target: &AnyObject,
+    action: Option<objc2::runtime::Sel>,
+    key: &str,
+    modifiers: NSEventModifierFlags,
+    mtm: MainThreadMarker,
+) -> Retained<NSMenuItem> {
+    let item = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            &NSString::from_str(title),
+            action,
+            &NSString::from_str(key),
+        )
+    };
+    unsafe { item.setTarget(Some(target)) };
+    item.setKeyEquivalentModifierMask(modifiers);
+    item
+}
+
+fn add_separator(menu: &NSMenu, mtm: MainThreadMarker) {
+    menu.addItem(&NSMenuItem::separatorItem(mtm));
+}
+
+fn add_submenu(parent: &NSMenu, title: &str, submenu: &NSMenu, mtm: MainThreadMarker) {
+    let item = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            &NSString::from_str(title),
+            None,
+            &NSString::from_str(""),
+        )
+    };
+    item.setSubmenu(Some(submenu));
+    parent.addItem(&item);
+}
+
+fn window_delegate_matches(delegate: &Delegate, target: &NSWindow) -> bool {
+    let Some(window) = delegate.ivars().window.get() else {
+        return false;
+    };
+    let window: &NSWindow = window;
+    ptr::eq(window, target)
+}
+
+fn window_delegate_is_visible(delegate: &Delegate) -> bool {
+    delegate
+        .ivars()
+        .window
+        .get()
+        .is_some_and(|window| window.isVisible())
 }
 
 fn section_label(title: &str, mtm: MainThreadMarker, x: f64, y: f64) -> Retained<NSTextField> {

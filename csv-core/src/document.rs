@@ -201,6 +201,10 @@ impl CsvDocument {
         self.dirty
     }
 
+    pub fn set_dirty(&mut self, dirty: bool) {
+        self.dirty = dirty;
+    }
+
     pub fn headers(&self) -> Option<&[String]> {
         self.headers.as_deref()
     }

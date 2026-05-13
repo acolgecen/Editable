@@ -6,6 +6,8 @@ use editable_csv_core::{
 use std::path::{Path, PathBuf};
 
 const MAX_UNDO_HISTORY: usize = 10;
+const BLANK_DOCUMENT_ROWS: usize = 25;
+const BLANK_DOCUMENT_COLUMNS: usize = 10;
 
 #[derive(Clone, PartialEq, Eq)]
 struct HistoryEntry {
@@ -59,24 +61,36 @@ impl EditableState {
 
     pub fn reopen_with_options(&mut self) -> Result<()> {
         let Some(doc) = &self.document else {
-            return self.open_sample();
+            return self.open_blank();
         };
         if let Some(path) = doc.path().map(Path::to_path_buf) {
             self.open_path(path)
         } else {
-            let bytes = include_bytes!("../../assets/samples/basic.csv").to_vec();
-            self.document = Some(CsvDocument::from_bytes(
+            let was_dirty = doc.is_dirty();
+            let bytes = doc.to_csv_bytes();
+            let mut document = CsvDocument::from_bytes(
                 bytes,
                 OpenOptions {
                     first_row_is_header: self.first_row_is_header,
                     skip_rows: self.skip_rows,
                 },
-            )?);
+            )?;
+            document.set_dirty(was_dirty);
+            self.document = Some(document);
             self.selection = Selection::default();
             self.last_error = None;
             self.clear_history();
             Ok(())
         }
+    }
+
+    pub fn open_blank(&mut self) -> Result<()> {
+        self.first_row_is_header = false;
+        self.document = Some(self.blank_document()?);
+        self.selection = Selection::default();
+        self.last_error = None;
+        self.clear_history();
+        Ok(())
     }
 
     pub fn open_sample(&mut self) -> Result<()> {
@@ -94,7 +108,7 @@ impl EditableState {
             .and_then(|path| path.file_name())
             .and_then(|name| name.to_str())
             .map(str::to_string)
-            .unwrap_or_else(|| "Editable".to_string())
+            .unwrap_or_else(|| "Untitled.csv".to_string())
     }
 
     pub fn preview_grid_text(&self, max_rows: usize, max_columns: usize) -> String {
@@ -488,6 +502,28 @@ impl EditableState {
         self.undo_stack.clear();
         self.redo_stack.clear();
     }
+
+    fn blank_document(&self) -> Result<CsvDocument> {
+        CsvDocument::from_bytes(
+            blank_csv_bytes(
+                self.skip_rows + BLANK_DOCUMENT_ROWS + usize::from(self.first_row_is_header),
+                BLANK_DOCUMENT_COLUMNS,
+            ),
+            OpenOptions {
+                first_row_is_header: self.first_row_is_header,
+                skip_rows: self.skip_rows,
+            },
+        )
+    }
+}
+
+fn blank_csv_bytes(records: usize, columns: usize) -> Vec<u8> {
+    let record = ",".repeat(columns.saturating_sub(1));
+    (0..records)
+        .map(|_| record.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .into_bytes()
 }
 
 fn fit(value: &str, width: usize) -> String {
@@ -596,5 +632,54 @@ mod tests {
             state.document.as_ref().unwrap().cell(0, 0).unwrap(),
             "third"
         );
+    }
+
+    #[test]
+    fn opens_blank_untitled_document_for_direct_launch() {
+        let mut state = EditableState::default();
+        state.open_blank().unwrap();
+
+        let doc = state.document.as_ref().unwrap();
+        assert!(!state.first_row_is_header);
+        assert_eq!(state.title(), "Untitled.csv");
+        assert_eq!(doc.row_count(), BLANK_DOCUMENT_ROWS);
+        assert_eq!(doc.column_count(), BLANK_DOCUMENT_COLUMNS);
+        assert_eq!(doc.cell(0, 0).unwrap(), "");
+    }
+
+    #[test]
+    fn blank_document_preserves_editable_size_with_skipped_rows() {
+        let mut state = EditableState {
+            skip_rows: 5,
+            ..EditableState::default()
+        };
+        state.open_blank().unwrap();
+
+        let doc = state.document.as_ref().unwrap();
+        assert_eq!(doc.row_count(), BLANK_DOCUMENT_ROWS);
+        assert_eq!(doc.column_count(), BLANK_DOCUMENT_COLUMNS);
+    }
+
+    #[test]
+    fn header_toggle_preserves_edited_untitled_rows() {
+        let mut state = EditableState::default();
+        state.open_blank().unwrap();
+        state.select_cell(0, 0);
+        state.set_cell("kept").unwrap();
+
+        state.first_row_is_header = true;
+        state.reopen_with_options().unwrap();
+
+        let doc = state.document.as_ref().unwrap();
+        assert!(doc.is_dirty());
+        assert_eq!(doc.header(0), Some("kept"));
+        assert_eq!(doc.cell(0, 0).unwrap(), "");
+
+        state.first_row_is_header = false;
+        state.reopen_with_options().unwrap();
+
+        let doc = state.document.as_ref().unwrap();
+        assert!(doc.is_dirty());
+        assert_eq!(doc.cell(0, 0).unwrap(), "kept");
     }
 }
