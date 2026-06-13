@@ -9,6 +9,10 @@ use std::path::{Path, PathBuf};
 const MAX_UNDO_HISTORY: usize = 10;
 const BLANK_DOCUMENT_ROWS: usize = 25;
 const BLANK_DOCUMENT_COLUMNS: usize = 10;
+// Above this many cells, skip full stats computation to keep the main thread responsive.
+const STATS_CELL_LIMIT: usize = 100_000;
+// Hard cap on cells copied to the clipboard at once to protect memory.
+pub const MAX_COPY_CELLS: usize = 1_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SelectionMetric {
@@ -209,6 +213,13 @@ impl EditableState {
         )
     }
 
+    pub fn selection_cell_count(&self) -> Option<usize> {
+        let doc = self.document.as_ref()?;
+        let (top, left, bottom, right) =
+            selection_bounds(&self.selection, doc.row_count(), doc.column_count())?;
+        Some((bottom - top + 1).saturating_mul(right - left + 1))
+    }
+
     pub fn selection_stats(&self) -> Vec<SelectionStat> {
         let Some(doc) = self.document.as_ref() else {
             return Vec::new();
@@ -218,6 +229,33 @@ impl EditableState {
         let column_count = doc.column_count();
         if row_count == 0 || column_count == 0 {
             return Vec::new();
+        }
+
+        // Compute cell count cheaply (no file reads) before deciding whether to iterate.
+        let cell_count: usize = match &self.selection {
+            Selection::Cells { cells, .. } => cells.len(),
+            Selection::Cell(rect) => {
+                let (top, left, bottom, right) = rect.bounds();
+                (bottom.min(row_count - 1).saturating_sub(top) + 1)
+                    .saturating_mul(right.min(column_count - 1).saturating_sub(left) + 1)
+            }
+            Selection::Row { anchor, focus } => {
+                let top = (*anchor).min(*focus);
+                let bottom = (*anchor).max(*focus).min(row_count - 1);
+                (bottom.saturating_sub(top) + 1).saturating_mul(column_count)
+            }
+            Selection::Column { anchor, focus } => {
+                let left = (*anchor).min(*focus);
+                let right = (*anchor).max(*focus).min(column_count - 1);
+                row_count.saturating_mul(right.saturating_sub(left) + 1)
+            }
+            Selection::All => row_count.saturating_mul(column_count),
+        };
+        if cell_count > STATS_CELL_LIMIT {
+            return vec![SelectionStat {
+                metric: SelectionMetric::Total,
+                value: cell_count.to_string(),
+            }];
         }
 
         match &self.selection {

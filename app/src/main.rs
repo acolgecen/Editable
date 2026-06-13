@@ -3,7 +3,7 @@
 mod app_state;
 mod selection;
 
-use app_state::{EditableState, SelectionMetric};
+use app_state::{EditableState, SelectionMetric, MAX_COPY_CELLS};
 use editable_csv_core::{FilterOperator, FilterRule, SortDirection, SortKey};
 use objc2::ffi::{NSInteger, NSUInteger};
 use objc2::rc::Retained;
@@ -2743,6 +2743,24 @@ impl Delegate {
     }
 
     fn copy_selection_to_pasteboard(&self) -> bool {
+        let cell_count = self.ivars().state.borrow().selection_cell_count();
+        if let Some(count) = cell_count {
+            if count > MAX_COPY_CELLS {
+                let mtm = self.mtm();
+                let alert = NSAlert::new(mtm);
+                alert.setAlertStyle(NSAlertStyle::Warning);
+                alert.setMessageText(&NSString::from_str("Selection Too Large to Copy"));
+                alert.setInformativeText(&NSString::from_str(&format!(
+                    "Your selection contains {} cells. Copying more than {} cells at once \
+                     would use too much memory. Select a smaller range and try again.",
+                    format_count(count),
+                    format_count(MAX_COPY_CELLS),
+                )));
+                alert.addButtonWithTitle(&NSString::from_str("OK"));
+                alert.runModal();
+                return false;
+            }
+        }
         let Some(text) = self.ivars().state.borrow().selected_text() else {
             return false;
         };
@@ -3388,6 +3406,18 @@ fn table_hit(table: &EditableTableView, event: &NSEvent) -> Option<TableHit> {
             table_column,
         }),
     }
+}
+
+fn format_count(n: usize) -> String {
+    let s = n.to_string();
+    let mut result = String::new();
+    for (i, ch) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            result.push(',');
+        }
+        result.push(ch);
+    }
+    result.chars().rev().collect()
 }
 
 fn visible_column_from_table_column(table_column: &NSTableColumn) -> Option<VisibleColumn> {
