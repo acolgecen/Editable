@@ -25,8 +25,8 @@ use objc2_app_kit::{
     NSTextFieldDelegate, NSTextView, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{
-    MainThreadMarker, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRange, NSRect, NSSize,
-    NSString, NSUserDefaults,
+    MainThreadMarker, NSArray, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRange,
+    NSRect, NSSize, NSString, NSUserDefaults,
 };
 use selection::Cell;
 use std::cell::{OnceCell, RefCell};
@@ -3442,17 +3442,21 @@ fn launch_path_arg() -> Option<PathBuf> {
     })
 }
 
+#[allow(deprecated)] // setAllowedFileTypes: is deprecated in favour of setAllowedContentTypes:
 fn choose_startup_file(mtm: MainThreadMarker) -> Option<PathBuf> {
     let panel = NSOpenPanel::openPanel(mtm);
     panel.setCanChooseFiles(true);
     panel.setCanChooseDirectories(false);
     panel.setAllowsMultipleSelection(false);
     panel.setResolvesAliases(true);
-    panel.setTitle(Some(&NSString::from_str("Open File")));
+    panel.setTitle(Some(&NSString::from_str("Open CSV File")));
     panel.setMessage(Some(&NSString::from_str(
-        "Choose a file to open in Editable.",
+        "Choose a CSV file to open in Editable.",
     )));
     panel.setPrompt(Some(&NSString::from_str("Open")));
+    panel.setAllowedFileTypes(Some(&NSArray::from_retained_slice(&[
+        NSString::from_str("csv"),
+    ])));
 
     if panel.runModal() == NSModalResponseOK {
         panel.URL().and_then(|url| url.to_file_path())
