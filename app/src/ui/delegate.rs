@@ -3,18 +3,17 @@ use crate::selection::Cell;
 use editable_csv_core::{FilterOperator, FilterRule, SortDirection, SortKey};
 use objc2::ffi::{NSInteger, NSUInteger};
 use objc2::rc::Retained;
-use objc2::runtime::{AnyObject, Bool, Sel};
+use objc2::runtime::{AnyObject, Bool};
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
-    NSAlert, NSAlertFirstButtonReturn, NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSApplicationTerminateReply, NSButton, NSControl, NSControlStateValueOn,
-    NSControlTextEditingDelegate, NSModalResponseCancel,
-    NSModalResponseOK, NSPopUpButton, NSTableColumn, NSTableView,
-    NSTableViewDataSource, NSTableViewDelegate, NSTextField, NSTextFieldCell,
-    NSTextFieldDelegate, NSTextView, NSWindow, NSWindowDelegate,
+    NSAlert, NSAlertFirstButtonReturn, NSApplication, NSApplicationActivationPolicy,
+    NSApplicationDelegate, NSApplicationTerminateReply, NSButton, NSControlStateValueOn,
+    NSControlTextEditingDelegate, NSModalResponseCancel, NSModalResponseOK, NSPopUpButton,
+    NSTableColumn, NSTableView, NSTableViewDataSource, NSTableViewDelegate, NSTextField,
+    NSTextFieldCell, NSTextFieldDelegate, NSWindow, NSWindowDelegate,
 };
 use objc2_foundation::{
-    MainThreadMarker, NSNotification, NSObject, NSObjectProtocol, NSPoint,
-    NSRect, NSSize, NSString,
+    MainThreadMarker, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
 };
 use std::path::PathBuf;
 use std::ptr;
@@ -35,8 +34,9 @@ define_class!(
     // SAFETY: NSObjectProtocol has no additional safety requirements.
     unsafe impl NSObjectProtocol for Delegate {}
 
-    // SAFETY: The text-editing delegate is used to turn field-editor arrow
-    // commands back into table navigation while a cell is being edited.
+    // SAFETY: The text-editing delegate drives the Find field's live search as
+    // the user types. Arrow keys are left to the field editor so they move the
+    // caret within the cell being edited.
     unsafe impl NSControlTextEditingDelegate for Delegate {
         #[unsafe(method(controlTextDidChange:))]
         fn control_text_did_change(&self, notification: &NSNotification) {
@@ -49,28 +49,6 @@ define_class!(
             if self.find_field_matches(&field) {
                 self.update_find_query_from_field(&field);
             }
-        }
-
-        #[unsafe(method(control:textView:doCommandBySelector:))]
-        #[allow(non_snake_case)]
-        unsafe fn control_textView_doCommandBySelector(
-            &self,
-            control: &NSControl,
-            text_view: &NSTextView,
-            command_selector: Sel,
-        ) -> Bool {
-            if self.find_field_matches_control(control) {
-                return false.into();
-            }
-            let Some((rows, columns, selector_extending)) =
-                navigation_delta_for_selector(command_selector)
-            else {
-                return false.into();
-            };
-            let extending = selector_extending || current_event_has_shift(self.mtm());
-            self.commit_text_view_edit(text_view);
-            self.navigate_selection(rows, columns, extending);
-            true.into()
         }
     }
 
@@ -1091,5 +1069,4 @@ impl Delegate {
             self.ivars().state.borrow_mut().last_error = None;
         }
     }
-
 }

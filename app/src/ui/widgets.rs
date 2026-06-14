@@ -3,13 +3,9 @@ use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::MainThreadOnly;
 use objc2_app_kit::{
-    NSButton,
-    NSColor, NSEventModifierFlags, NSFont, NSMenu, NSMenuItem, NSPopUpButton, NSTextField,
+    NSButton, NSColor, NSEventModifierFlags, NSFont, NSMenu, NSMenuItem, NSPopUpButton, NSTextField,
 };
-use objc2_foundation::{
-    MainThreadMarker, NSPoint,
-    NSRect, NSSize, NSString,
-};
+use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize, NSString};
 
 // Reusable AppKit control builders (buttons, popups, labels, menu items)
 // shared by the panels and dialogs.
@@ -73,7 +69,12 @@ pub(crate) fn add_submenu(parent: &NSMenu, title: &str, submenu: &NSMenu, mtm: M
     parent.addItem(&item);
 }
 
-pub(crate) fn section_label(title: &str, mtm: MainThreadMarker, x: f64, y: f64) -> Retained<NSTextField> {
+pub(crate) fn section_label(
+    title: &str,
+    mtm: MainThreadMarker,
+    x: f64,
+    y: f64,
+) -> Retained<NSTextField> {
     let label = NSTextField::labelWithString(&NSString::from_str(title), mtm);
     label.setFrame(NSRect::new(NSPoint::new(x, y), NSSize::new(220.0, 20.0)));
     label.setFont(Some(&NSFont::boldSystemFontOfSize(13.0)));
@@ -119,4 +120,3 @@ pub(crate) fn popup(
     }
     popup
 }
-

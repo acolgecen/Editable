@@ -4,15 +4,14 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
-    NSAutoresizingMaskOptions, NSBackingStoreType,
-    NSBezelStyle, NSBorderType, NSBox, NSBoxType, NSButton, NSCellImagePosition,
-    NSColor, NSControl, NSEvent, NSFont, NSImage, NSImageScaling, NSPopUpButton, NSProgressIndicator, NSProgressIndicatorStyle, NSScrollView, NSTableColumn, NSTableView, NSTableViewColumnAutoresizingStyle, NSTableViewGridLineStyle,
-    NSTableViewSelectionHighlightStyle, NSTextAlignment, NSTextField, NSTextFieldCell, NSView, NSWindow, NSWindowStyleMask,
+    NSAutoresizingMaskOptions, NSBackingStoreType, NSBezelStyle, NSBorderType, NSBox, NSBoxType,
+    NSButton, NSCellImagePosition, NSColor, NSControl, NSEvent, NSFont, NSImage, NSImageScaling,
+    NSPopUpButton, NSProgressIndicator, NSProgressIndicatorStyle, NSScrollView, NSTableColumn,
+    NSTableView, NSTableViewColumnAutoresizingStyle, NSTableViewGridLineStyle,
+    NSTableViewSelectionHighlightStyle, NSTextAlignment, NSTextField, NSTextFieldCell, NSView,
+    NSWindow, NSWindowStyleMask,
 };
-use objc2_foundation::{
-    MainThreadMarker, NSPoint,
-    NSRect, NSSize, NSString, NSUserDefaults,
-};
+use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize, NSString, NSUserDefaults};
 use std::cell::OnceCell;
 
 // Window chrome and the table view: constructing the AppKit view tree
@@ -712,7 +711,6 @@ impl Delegate {
             table.setAllowsColumnReordering(!saving);
         }
     }
-
 }
 
 pub(crate) fn apply_table_cell_style(
@@ -778,7 +776,9 @@ pub(crate) fn disable_window_restoration() {
         .setBool_forKey(false, &NSString::from_str("NSQuitAlwaysKeepsWindows"));
 }
 
-pub(crate) fn visible_column_from_table_column(table_column: &NSTableColumn) -> Option<VisibleColumn> {
+pub(crate) fn visible_column_from_table_column(
+    table_column: &NSTableColumn,
+) -> Option<VisibleColumn> {
     let identifier = table_column.identifier().to_string();
     if identifier == ROW_NUMBER_COLUMN {
         return Some(VisibleColumn::RowNumber);
@@ -884,4 +884,3 @@ pub(crate) fn status_label_y() -> f64 {
 pub(crate) fn status_control_y() -> f64 {
     (STATUS_HEIGHT - STATUS_CONTROL_HEIGHT) / 2.0
 }
-

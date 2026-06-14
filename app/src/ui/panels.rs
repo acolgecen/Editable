@@ -6,13 +6,10 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{msg_send, sel, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
-    NSApplication, NSBackingStoreType, NSButton, NSButtonType,
-    NSColor, NSControl, NSControlStateValueOff, NSControlStateValueOn, NSFont, NSPopUpButton, NSTextField, NSView, NSWindow, NSWindowStyleMask,
+    NSApplication, NSBackingStoreType, NSButton, NSButtonType, NSColor, NSControlStateValueOff,
+    NSControlStateValueOn, NSFont, NSPopUpButton, NSTextField, NSView, NSWindow, NSWindowStyleMask,
 };
-use objc2_foundation::{
-    NSPoint,
-    NSRect, NSSize, NSString,
-};
+use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 use std::ptr;
 
 // The auxiliary panels: Find, Formatting, and Sort & Filter. Each owns its
@@ -207,7 +204,11 @@ impl Delegate {
         self.ivars().formatting_panel.replace(None);
     }
 
-    pub(crate) fn build_formatting_panel(&self, window: Retained<NSWindow>, error: &str) -> FormattingPanel {
+    pub(crate) fn build_formatting_panel(
+        &self,
+        window: Retained<NSWindow>,
+        error: &str,
+    ) -> FormattingPanel {
         let mtm = self.mtm();
         let target = unsafe { any_ref(self) };
         let width = 460.0;
@@ -502,7 +503,13 @@ impl Delegate {
         y -= 34.0;
         let mut filter_rows = Vec::new();
         if filter_rules.is_empty() {
-            content.addSubview(&secondary_label("No filter rules", mtm, 24.0, y + 4.0, 220.0));
+            content.addSubview(&secondary_label(
+                "No filter rules",
+                mtm,
+                24.0,
+                y + 4.0,
+                220.0,
+            ));
         } else {
             for (index, rule) in filter_rules.iter().enumerate() {
                 let column = popup(
@@ -818,18 +825,6 @@ impl Delegate {
             })
     }
 
-    pub(crate) fn find_field_matches_control(&self, control: &NSControl) -> bool {
-        self.ivars()
-            .find_panel
-            .borrow()
-            .as_ref()
-            .is_some_and(|panel| {
-                let panel_field = &*panel.field as *const NSTextField as *const ();
-                let control = control as *const NSControl as *const ();
-                ptr::eq(panel_field, control)
-            })
-    }
-
     pub(crate) fn find_window_matches(&self, window: &NSWindow) -> bool {
         self.ivars()
             .find_panel
@@ -840,7 +835,6 @@ impl Delegate {
                 ptr::eq(panel_window, window)
             })
     }
-
 }
 
 pub(crate) fn delimiter_titles() -> Vec<String> {
@@ -959,4 +953,3 @@ pub(crate) fn filter_operator_at(index: NSInteger) -> FilterOperator {
         _ => FilterOperator::Contains,
     }
 }
-

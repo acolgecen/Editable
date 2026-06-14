@@ -2,15 +2,12 @@ use super::*;
 use crate::selection::Cell;
 use crate::state::MAX_COPY_CELLS;
 use objc2::ffi::{NSInteger, NSUInteger};
-use objc2::runtime::Sel;
-use objc2::{sel, DefinedClass, MainThreadOnly};
+use objc2::{DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
-    NSAlert, NSAlertStyle, NSApplication, NSEvent, NSEventModifierFlags, NSPasteboard, NSPasteboardTypeString,
-    NSPasteboardTypeTabularText, NSTextView,
+    NSAlert, NSAlertStyle, NSEvent, NSEventModifierFlags, NSPasteboard, NSPasteboardTypeString,
+    NSPasteboardTypeTabularText,
 };
-use objc2_foundation::{
-    MainThreadMarker, NSRange, NSString,
-};
+use objc2_foundation::{NSRange, NSString};
 
 // Pointer and keyboard handling: translating table clicks/drags and key
 // presses into selection changes, cell edits, and clipboard copies.
@@ -28,7 +25,6 @@ pub(crate) enum TableHit {
     RowNumber(usize),
     Data { cell: Cell, table_column: NSInteger },
 }
-
 
 impl Delegate {
     pub(crate) fn navigate_selection(&self, rows: isize, columns: isize, extending: bool) {
@@ -103,12 +99,6 @@ impl Delegate {
             }
         }
         true
-    }
-
-    pub(crate) fn commit_text_view_edit(&self, _text_view: &NSTextView) {
-        if let Some(window) = self.ivars().window.get() {
-            unsafe { window.endEditingFor(None) };
-        }
     }
 
     pub(crate) fn table_mouse_down(&self, table: &EditableTableView, event: &NSEvent) {
@@ -329,7 +319,6 @@ impl Delegate {
 
         false
     }
-
 }
 
 pub(crate) fn navigation_delta_for_key_code(key_code: u16) -> Option<(isize, isize)> {
@@ -340,26 +329,6 @@ pub(crate) fn navigation_delta_for_key_code(key_code: u16) -> Option<(isize, isi
         KEY_RIGHT_ARROW => Some((0, 1)),
         _ => None,
     }
-}
-
-pub(crate) fn navigation_delta_for_selector(selector: Sel) -> Option<(isize, isize, bool)> {
-    match selector {
-        selector if selector == sel!(moveUp:) => Some((-1, 0, false)),
-        selector if selector == sel!(moveDown:) => Some((1, 0, false)),
-        selector if selector == sel!(moveLeft:) => Some((0, -1, false)),
-        selector if selector == sel!(moveRight:) => Some((0, 1, false)),
-        selector if selector == sel!(moveUpAndModifySelection:) => Some((-1, 0, true)),
-        selector if selector == sel!(moveDownAndModifySelection:) => Some((1, 0, true)),
-        selector if selector == sel!(moveLeftAndModifySelection:) => Some((0, -1, true)),
-        selector if selector == sel!(moveRightAndModifySelection:) => Some((0, 1, true)),
-        _ => None,
-    }
-}
-
-pub(crate) fn current_event_has_shift(mtm: MainThreadMarker) -> bool {
-    NSApplication::sharedApplication(mtm)
-        .currentEvent()
-        .is_some_and(|event| event.modifierFlags().contains(NSEventModifierFlags::Shift))
 }
 
 pub(crate) fn is_cell_edit_start_text(text: &str) -> bool {
@@ -401,4 +370,3 @@ pub(crate) fn format_count(n: usize) -> String {
     }
     result.chars().rev().collect()
 }
-

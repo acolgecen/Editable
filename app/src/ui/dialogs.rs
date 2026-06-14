@@ -3,15 +3,11 @@ use objc2::runtime::AnyObject;
 use objc2::{msg_send, sel, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
     NSAlert, NSAlertFirstButtonReturn, NSAlertSecondButtonReturn, NSAlertStyle,
-    NSAlertThirdButtonReturn, NSApplication,
-    NSApplicationLaunchIsDefaultLaunchKey, NSEventModifierFlags, NSImage,
-    NSImageNameApplicationIcon, NSMenu,
-    NSModalResponseOK, NSOpenPanel,
-    NSSavePanel, NSWindow,
+    NSAlertThirdButtonReturn, NSApplication, NSApplicationLaunchIsDefaultLaunchKey,
+    NSEventModifierFlags, NSImage, NSImageNameApplicationIcon, NSMenu, NSModalResponseOK,
+    NSOpenPanel, NSSavePanel, NSWindow,
 };
-use objc2_foundation::{
-    MainThreadMarker, NSArray, NSNotification, NSString,
-};
+use objc2_foundation::{MainThreadMarker, NSArray, NSNotification, NSString};
 use std::env;
 use std::path::PathBuf;
 use std::ptr;
@@ -381,9 +377,9 @@ pub(crate) fn choose_startup_file(mtm: MainThreadMarker) -> Option<PathBuf> {
         "Choose a CSV file to open in Editable.",
     )));
     panel.setPrompt(Some(&NSString::from_str("Open")));
-    panel.setAllowedFileTypes(Some(&NSArray::from_retained_slice(&[
-        NSString::from_str("csv"),
-    ])));
+    panel.setAllowedFileTypes(Some(&NSArray::from_retained_slice(&[NSString::from_str(
+        "csv",
+    )])));
 
     if panel.runModal() == NSModalResponseOK {
         panel.URL().and_then(|url| url.to_file_path())
@@ -406,7 +402,6 @@ pub(crate) fn choose_welcome_action(mtm: MainThreadMarker) -> WelcomeChoice {
     alert.addButtonWithTitle(&NSString::from_str("Create New File"));
     alert.addButtonWithTitle(&NSString::from_str("Open Existing File"));
     alert.addButtonWithTitle(&NSString::from_str("Cancel"));
-    // Hidden 4th button captures Cmd+Q so it works while the alert modal is running.
     alert.addButtonWithTitle(&NSString::from_str("Quit Editable"));
     let buttons = alert.buttons();
     if buttons.count() >= 3 {
@@ -415,10 +410,11 @@ pub(crate) fn choose_welcome_action(mtm: MainThreadMarker) -> WelcomeChoice {
         cancel_button.setKeyEquivalentModifierMask(NSEventModifierFlags::empty());
     }
     if buttons.count() >= 4 {
+        // A visible Quit button that also responds to Cmd+Q while the modal runs;
+        // a hidden button does not handle its key equivalent.
         let quit_button = buttons.objectAtIndex(3);
         quit_button.setKeyEquivalent(&NSString::from_str("q"));
         quit_button.setKeyEquivalentModifierMask(NSEventModifierFlags::Command);
-        quit_button.setHidden(true);
     }
 
     match alert.runModal() {
@@ -461,4 +457,3 @@ pub(crate) fn window_delegate_is_visible(delegate: &Delegate) -> bool {
         .get()
         .is_some_and(|window| window.isVisible())
 }
-
