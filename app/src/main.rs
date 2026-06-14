@@ -12,7 +12,8 @@ use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadOnly, Message};
 use objc2_app_kit::{
     NSAlert, NSAlertFirstButtonReturn, NSAlertSecondButtonReturn, NSAlertStyle,
     NSAlertThirdButtonReturn, NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate,
-    NSApplicationLaunchIsDefaultLaunchKey, NSAutoresizingMaskOptions, NSBackingStoreType,
+    NSApplicationLaunchIsDefaultLaunchKey, NSApplicationTerminateReply,
+    NSAutoresizingMaskOptions, NSBackingStoreType,
     NSBezelStyle, NSBorderType, NSBox, NSBoxType, NSButton, NSButtonType, NSCellImagePosition,
     NSColor, NSControl, NSControlStateValueOff, NSControlStateValueOn,
     NSControlTextEditingDelegate, NSEvent, NSEventModifierFlags, NSFont, NSImage,
@@ -343,6 +344,59 @@ define_class!(
         #[unsafe(method(applicationShouldOpenUntitledFile:))]
         fn should_open_untitled_file(&self, _app: &NSApplication) -> bool {
             false
+        }
+
+        #[unsafe(method(applicationShouldTerminate:))]
+        fn application_should_terminate(
+            &self,
+            _sender: &NSApplication,
+        ) -> NSApplicationTerminateReply {
+            if self
+                .ivars()
+                .state
+                .borrow()
+                .document
+                .as_ref()
+                .is_some_and(editable_csv_core::CsvDocument::is_dirty)
+            {
+                match self.confirm_close_with_unsaved_changes() {
+                    CloseChoice::Save => {
+                        if !self.save_document_with_prompt() {
+                            return NSApplicationTerminateReply::TerminateCancel;
+                        }
+                    }
+                    CloseChoice::Discard => {}
+                    CloseChoice::Cancel => {
+                        return NSApplicationTerminateReply::TerminateCancel;
+                    }
+                }
+            }
+
+            let delegates = self.ivars().window_delegates.borrow().clone();
+            for delegate in &delegates {
+                if delegate
+                    .ivars()
+                    .state
+                    .borrow()
+                    .document
+                    .as_ref()
+                    .is_some_and(editable_csv_core::CsvDocument::is_dirty)
+                {
+                    match delegate.confirm_close_with_unsaved_changes() {
+                        CloseChoice::Save => {
+                            if !delegate.save_document_with_prompt() {
+                                return NSApplicationTerminateReply::TerminateCancel;
+                            }
+                        }
+                        CloseChoice::Discard => {}
+                        CloseChoice::Cancel => {
+                            return NSApplicationTerminateReply::TerminateCancel;
+                        }
+                    }
+                }
+            }
+
+            NSApplicationTerminateReply::TerminateNow
         }
 
         #[unsafe(method(applicationShouldTerminateAfterLastWindowClosed:))]
