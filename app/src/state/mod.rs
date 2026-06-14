@@ -1,72 +1,26 @@
+//! The editor's document state: the open [`CsvDocument`], the current
+//! [`Selection`], formatting options, and the editing operations the UI drives.
+//!
+//! Submodules keep the larger concerns separate:
+//! - [`history`] — undo/redo machinery (`record_undoable`, `undo`, `redo`).
+//! - [`stats`] — selection statistics shown in the status bar.
+
+mod history;
+mod stats;
+
 use crate::selection::{Cell, Selection};
 use editable_csv_core::{
-    ColumnFilter, CsvDocument, CsvDocumentSnapshot, FilterRule, OpenOptions, Result, SortDirection,
-    SortKey,
+    ColumnFilter, CsvDocument, FilterRule, OpenOptions, Result, SortDirection, SortKey,
 };
-use std::collections::HashSet;
+use history::HistoryEntry;
 use std::path::{Path, PathBuf};
 
-const MAX_UNDO_HISTORY: usize = 10;
+pub use stats::SelectionMetric;
+
 const BLANK_DOCUMENT_ROWS: usize = 25;
 const BLANK_DOCUMENT_COLUMNS: usize = 10;
-// Above this many cells, skip full stats computation to keep the main thread responsive.
-const STATS_CELL_LIMIT: usize = 100_000;
 // Hard cap on cells copied to the clipboard at once to protect memory.
 pub const MAX_COPY_CELLS: usize = 1_000_000;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SelectionMetric {
-    Values,
-    Blanks,
-    Distinct,
-    Total,
-    Minimum,
-    Average,
-    Median,
-    Maximum,
-    Summary,
-}
-
-impl SelectionMetric {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Values => "Values",
-            Self::Blanks => "Blanks",
-            Self::Distinct => "Distinct",
-            Self::Total => "Total",
-            Self::Minimum => "Minimum",
-            Self::Average => "Average",
-            Self::Median => "Median",
-            Self::Maximum => "Maximum",
-            Self::Summary => "Summary",
-        }
-    }
-}
-
-impl Default for SelectionMetric {
-    fn default() -> Self {
-        Self::Values
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SelectionStat {
-    pub metric: SelectionMetric,
-    pub value: String,
-}
-
-impl SelectionStat {
-    pub fn display_text(&self) -> String {
-        format!("{}: {}", self.metric.label(), self.value)
-    }
-}
-
-#[derive(Clone, PartialEq, Eq)]
-struct HistoryEntry {
-    document: CsvDocumentSnapshot,
-    selection: Selection,
-    filter_text: String,
-}
 
 pub struct EditableState {
     pub document: Option<CsvDocument>,
@@ -96,6 +50,7 @@ impl Default for EditableState {
     }
 }
 
+/// Document lifecycle: opening, reopening with new options, and saving.
 #[allow(dead_code)]
 impl EditableState {
     pub fn open_path(&mut self, path: impl AsRef<Path>) -> Result<()> {
@@ -115,10 +70,6 @@ impl EditableState {
         if let Some(path) = doc.path().map(Path::to_path_buf) {
             let document = CsvDocument::open(path, self.open_options(Some(self.delimiter)))?;
             self.document = Some(document);
-            self.selection = Selection::default();
-            self.last_error = None;
-            self.clear_history();
-            Ok(())
         } else {
             let was_dirty = doc.is_dirty();
             let bytes = doc.to_csv_bytes_with_delimiter_untrimmed(self.delimiter);
@@ -126,11 +77,11 @@ impl EditableState {
                 CsvDocument::from_bytes(bytes, self.open_options(Some(self.delimiter)))?;
             document.set_dirty(was_dirty);
             self.document = Some(document);
-            self.selection = Selection::default();
-            self.last_error = None;
-            self.clear_history();
-            Ok(())
         }
+        self.selection = Selection::default();
+        self.last_error = None;
+        self.clear_history();
+        Ok(())
     }
 
     pub fn open_blank(&mut self) -> Result<()> {
@@ -143,7 +94,7 @@ impl EditableState {
     }
 
     pub fn open_sample(&mut self) -> Result<()> {
-        let sample = include_bytes!("../../assets/samples/basic.csv").to_vec();
+        let sample = include_bytes!("../../../assets/samples/basic.csv").to_vec();
         let document = CsvDocument::from_bytes(sample, OpenOptions::default())?;
         self.delimiter = document.dialect().delimiter;
         self.document = Some(document);
@@ -152,6 +103,41 @@ impl EditableState {
         Ok(())
     }
 
+    pub fn save(&mut self, target: Option<PathBuf>) -> Result<()> {
+        let Some(doc) = &mut self.document else {
+            return Ok(());
+        };
+        let path = target
+            .or_else(|| doc.path().map(Path::to_path_buf))
+            .unwrap_or_else(|| PathBuf::from("Editable.csv"));
+        doc.save_to(path)?;
+        self.clear_history();
+        Ok(())
+    }
+
+    fn blank_document(&self) -> Result<CsvDocument> {
+        CsvDocument::from_bytes(
+            blank_csv_bytes(
+                self.skip_rows + BLANK_DOCUMENT_ROWS + usize::from(self.first_row_is_header),
+                BLANK_DOCUMENT_COLUMNS,
+                self.delimiter,
+            ),
+            self.open_options(Some(self.delimiter)),
+        )
+    }
+
+    fn open_options(&self, delimiter: Option<u8>) -> OpenOptions {
+        OpenOptions {
+            first_row_is_header: self.first_row_is_header,
+            skip_rows: self.skip_rows,
+            delimiter,
+        }
+    }
+}
+
+/// Read-only views over the document used to render the UI.
+#[allow(dead_code)]
+impl EditableState {
     pub fn title(&self) -> String {
         self.document
             .as_ref()
@@ -203,8 +189,7 @@ impl EditableState {
         let Some(doc) = &self.document else {
             return "Open a CSV file to start editing.".to_string();
         };
-        let stats = doc.edit_stats();
-        let edited = edit_stats_text(stats, doc.is_dirty());
+        let edited = edit_stats_text(doc.edit_stats(), doc.is_dirty());
         format!(
             "{} rows x {} columns{}",
             doc.row_count(),
@@ -220,90 +205,6 @@ impl EditableState {
         Some((bottom - top + 1).saturating_mul(right - left + 1))
     }
 
-    pub fn selection_stats(&self) -> Vec<SelectionStat> {
-        let Some(doc) = self.document.as_ref() else {
-            return Vec::new();
-        };
-        let mut values = Vec::new();
-        let row_count = doc.row_count();
-        let column_count = doc.column_count();
-        if row_count == 0 || column_count == 0 {
-            return Vec::new();
-        }
-
-        // Compute cell count cheaply (no file reads) before deciding whether to iterate.
-        let cell_count: usize = match &self.selection {
-            Selection::Cells { cells, .. } => cells.len(),
-            Selection::Cell(rect) => {
-                let (top, left, bottom, right) = rect.bounds();
-                (bottom.min(row_count - 1).saturating_sub(top) + 1)
-                    .saturating_mul(right.min(column_count - 1).saturating_sub(left) + 1)
-            }
-            Selection::Row { anchor, focus } => {
-                let top = (*anchor).min(*focus);
-                let bottom = (*anchor).max(*focus).min(row_count - 1);
-                (bottom.saturating_sub(top) + 1).saturating_mul(column_count)
-            }
-            Selection::Column { anchor, focus } => {
-                let left = (*anchor).min(*focus);
-                let right = (*anchor).max(*focus).min(column_count - 1);
-                row_count.saturating_mul(right.saturating_sub(left) + 1)
-            }
-            Selection::All => row_count.saturating_mul(column_count),
-        };
-        if cell_count > STATS_CELL_LIMIT {
-            return vec![SelectionStat {
-                metric: SelectionMetric::Total,
-                value: cell_count.to_string(),
-            }];
-        }
-
-        match &self.selection {
-            Selection::Cells { cells, .. } => {
-                for cell in cells {
-                    if cell.row < row_count && cell.column < column_count {
-                        values.push(doc.cell(cell.row, cell.column).unwrap_or_default());
-                    }
-                }
-            }
-            Selection::Cell(rect) => {
-                let (top, left, bottom, right) = rect.bounds();
-                for row in top..=bottom.min(row_count - 1) {
-                    for column in left..=right.min(column_count - 1) {
-                        values.push(doc.cell(row, column).unwrap_or_default());
-                    }
-                }
-            }
-            Selection::Row { anchor, focus } => {
-                let top = (*anchor).min(*focus);
-                let bottom = (*anchor).max(*focus).min(row_count - 1);
-                for row in top..=bottom {
-                    for column in 0..column_count {
-                        values.push(doc.cell(row, column).unwrap_or_default());
-                    }
-                }
-            }
-            Selection::Column { anchor, focus } => {
-                let left = (*anchor).min(*focus);
-                let right = (*anchor).max(*focus).min(column_count - 1);
-                for row in 0..row_count {
-                    for column in left..=right {
-                        values.push(doc.cell(row, column).unwrap_or_default());
-                    }
-                }
-            }
-            Selection::All => {
-                for row in 0..row_count {
-                    for column in 0..column_count {
-                        values.push(doc.cell(row, column).unwrap_or_default());
-                    }
-                }
-            }
-        }
-
-        selection_stats(values)
-    }
-
     pub fn column_title(&self, column: usize) -> String {
         let Some(doc) = &self.document else {
             return spreadsheet_column_name(column);
@@ -314,6 +215,65 @@ impl EditableState {
         spreadsheet_column_name(column)
     }
 
+    pub fn selected_text(&self) -> Option<String> {
+        let doc = self.document.as_ref()?;
+        let (top, left, bottom, right) =
+            selection_bounds(&self.selection, doc.row_count(), doc.column_count())?;
+        let mut rows = Vec::new();
+        for row in top..=bottom {
+            let mut values = Vec::new();
+            for column in left..=right {
+                values.push(if self.selection.contains_cell(row, column) {
+                    doc.cell(row, column).unwrap_or_default()
+                } else {
+                    String::new()
+                });
+            }
+            rows.push(values.join("\t"));
+        }
+        Some(rows.join("\n"))
+    }
+
+    pub fn find_matches(&self, query: &str) -> Vec<Cell> {
+        let query = query.trim().to_lowercase();
+        if query.is_empty() {
+            return Vec::new();
+        }
+        let Some(doc) = self.document.as_ref() else {
+            return Vec::new();
+        };
+
+        let mut matches = Vec::new();
+        for row in 0..doc.row_count() {
+            for column in 0..doc.column_count() {
+                let value = doc.cell(row, column).unwrap_or_default();
+                if value.to_lowercase().contains(&query) {
+                    matches.push(Cell { row, column });
+                }
+            }
+        }
+        matches
+    }
+
+    pub fn sort_keys(&self) -> Vec<SortKey> {
+        self.document
+            .as_ref()
+            .map(CsvDocument::sort_keys)
+            .unwrap_or_default()
+    }
+
+    pub fn filter_rules(&self) -> Vec<FilterRule> {
+        self.document
+            .as_ref()
+            .map(CsvDocument::filter_rules)
+            .unwrap_or_default()
+    }
+}
+
+/// Mutating operations. Each one is wrapped in [`Self::record_undoable`] so it
+/// participates in undo/redo and rolls back cleanly on error.
+#[allow(dead_code)]
+impl EditableState {
     pub fn set_cell(&mut self, value: impl Into<String>) -> Result<()> {
         let value = value.into();
         self.record_undoable(move |state| {
@@ -376,46 +336,6 @@ impl EditableState {
         })
     }
 
-    pub fn selected_text(&self) -> Option<String> {
-        let doc = self.document.as_ref()?;
-        let (top, left, bottom, right) =
-            selection_bounds(&self.selection, doc.row_count(), doc.column_count())?;
-        let mut rows = Vec::new();
-        for row in top..=bottom {
-            let mut values = Vec::new();
-            for column in left..=right {
-                values.push(if self.selection.contains_cell(row, column) {
-                    doc.cell(row, column).unwrap_or_default()
-                } else {
-                    String::new()
-                });
-            }
-            rows.push(values.join("\t"));
-        }
-        Some(rows.join("\n"))
-    }
-
-    pub fn find_matches(&self, query: &str) -> Vec<Cell> {
-        let query = query.trim().to_lowercase();
-        if query.is_empty() {
-            return Vec::new();
-        }
-        let Some(doc) = self.document.as_ref() else {
-            return Vec::new();
-        };
-
-        let mut matches = Vec::new();
-        for row in 0..doc.row_count() {
-            for column in 0..doc.column_count() {
-                let value = doc.cell(row, column).unwrap_or_default();
-                if value.to_lowercase().contains(&query) {
-                    matches.push(Cell { row, column });
-                }
-            }
-        }
-        matches
-    }
-
     pub fn delete_selection(&mut self) -> Result<()> {
         self.record_undoable(|state| {
             if let Some(doc) = &mut state.document {
@@ -454,20 +374,6 @@ impl EditableState {
             }
             Ok(())
         })
-    }
-
-    pub fn sort_keys(&self) -> Vec<SortKey> {
-        self.document
-            .as_ref()
-            .map(CsvDocument::sort_keys)
-            .unwrap_or_default()
-    }
-
-    pub fn filter_rules(&self) -> Vec<FilterRule> {
-        self.document
-            .as_ref()
-            .map(CsvDocument::filter_rules)
-            .unwrap_or_default()
     }
 
     pub fn apply_sort_filter_rules(
@@ -543,7 +449,11 @@ impl EditableState {
             Ok(())
         })
     }
+}
 
+/// Selection updates. These never touch the document, so they are not undoable.
+#[allow(dead_code)]
+impl EditableState {
     pub fn move_selection(&mut self, rows: isize, columns: isize, extending: bool) {
         let Some(doc) = &self.document else {
             return;
@@ -616,113 +526,6 @@ impl EditableState {
             focus: column,
         };
     }
-
-    pub fn save(&mut self, target: Option<PathBuf>) -> Result<()> {
-        let Some(doc) = &mut self.document else {
-            return Ok(());
-        };
-        let path = target
-            .or_else(|| doc.path().map(Path::to_path_buf))
-            .unwrap_or_else(|| PathBuf::from("Editable.csv"));
-        doc.save_to(path)?;
-        self.clear_history();
-        Ok(())
-    }
-
-    pub fn undo(&mut self) -> bool {
-        let Some(entry) = self.undo_stack.pop() else {
-            return false;
-        };
-        if let Some(current) = self.history_snapshot() {
-            self.redo_stack.push(current);
-        }
-        self.restore_history_entry(entry);
-        true
-    }
-
-    pub fn redo(&mut self) -> bool {
-        let Some(entry) = self.redo_stack.pop() else {
-            return false;
-        };
-        if let Some(current) = self.history_snapshot() {
-            self.push_undo(current);
-        }
-        self.restore_history_entry(entry);
-        true
-    }
-
-    pub fn can_undo(&self) -> bool {
-        !self.undo_stack.is_empty()
-    }
-
-    pub fn can_redo(&self) -> bool {
-        !self.redo_stack.is_empty()
-    }
-
-    fn record_undoable(&mut self, change: impl FnOnce(&mut Self) -> Result<()>) -> Result<()> {
-        let Some(before) = self.history_snapshot() else {
-            return change(self);
-        };
-
-        if let Err(err) = change(self) {
-            self.restore_history_entry(before);
-            return Err(err);
-        }
-
-        if self.history_snapshot().is_some_and(|after| after != before) {
-            self.push_undo(before);
-            self.redo_stack.clear();
-        }
-        Ok(())
-    }
-
-    fn history_snapshot(&self) -> Option<HistoryEntry> {
-        self.document.as_ref().map(|document| HistoryEntry {
-            document: document.snapshot(),
-            selection: self.selection.clone(),
-            filter_text: self.filter_text.clone(),
-        })
-    }
-
-    fn restore_history_entry(&mut self, entry: HistoryEntry) {
-        if let Some(document) = &mut self.document {
-            document.restore_snapshot(entry.document);
-            self.selection = entry.selection;
-            self.filter_text = entry.filter_text;
-            self.last_error = None;
-        }
-    }
-
-    fn push_undo(&mut self, entry: HistoryEntry) {
-        if self.undo_stack.len() == MAX_UNDO_HISTORY {
-            self.undo_stack.remove(0);
-        }
-        self.undo_stack.push(entry);
-    }
-
-    fn clear_history(&mut self) {
-        self.undo_stack.clear();
-        self.redo_stack.clear();
-    }
-
-    fn blank_document(&self) -> Result<CsvDocument> {
-        CsvDocument::from_bytes(
-            blank_csv_bytes(
-                self.skip_rows + BLANK_DOCUMENT_ROWS + usize::from(self.first_row_is_header),
-                BLANK_DOCUMENT_COLUMNS,
-                self.delimiter,
-            ),
-            self.open_options(Some(self.delimiter)),
-        )
-    }
-
-    fn open_options(&self, delimiter: Option<u8>) -> OpenOptions {
-        OpenOptions {
-            first_row_is_header: self.first_row_is_header,
-            skip_rows: self.skip_rows,
-            delimiter,
-        }
-    }
 }
 
 fn blank_csv_bytes(records: usize, columns: usize, delimiter: u8) -> Vec<u8> {
@@ -735,6 +538,8 @@ fn blank_csv_bytes(records: usize, columns: usize, delimiter: u8) -> Vec<u8> {
         .into_bytes()
 }
 
+/// The inclusive `(top, left, bottom, right)` bounding box of `selection`,
+/// clamped to the document, or `None` when the document is empty.
 fn selection_bounds(
     selection: &Selection,
     row_count: usize,
@@ -790,6 +595,8 @@ fn selection_bounds(
     }
 }
 
+/// Truncate `value` to `width` display characters, adding an ellipsis and
+/// left-padding the result to exactly `width`.
 fn fit(value: &str, width: usize) -> String {
     let mut chars = value.chars();
     let mut out = String::new();
@@ -855,122 +662,6 @@ fn edit_stats_text(stats: editable_csv_core::EditStats, dirty: bool) -> String {
     }
 }
 
-fn selection_stats(values: Vec<String>) -> Vec<SelectionStat> {
-    let total = values.len();
-    if total <= 1 {
-        return Vec::new();
-    }
-
-    let mut filled = 0;
-    let mut distinct = HashSet::new();
-    let mut numbers = Vec::new();
-    let mut all_filled_values_are_numbers = true;
-
-    for value in values {
-        let trimmed = value.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        filled += 1;
-        distinct.insert(trimmed.to_string());
-        match trimmed.parse::<f64>() {
-            Ok(number) if number.is_finite() => numbers.push(number),
-            _ => all_filled_values_are_numbers = false,
-        }
-    }
-
-    let empty = total - filled;
-    if filled > 0 && all_filled_values_are_numbers {
-        numbers.sort_by(|a, b| a.total_cmp(b));
-        let sum: f64 = numbers.iter().sum();
-        let average = sum / numbers.len() as f64;
-        let median = if numbers.len() % 2 == 0 {
-            let upper = numbers.len() / 2;
-            (numbers[upper - 1] + numbers[upper]) / 2.0
-        } else {
-            numbers[numbers.len() / 2]
-        };
-        vec![
-            SelectionStat {
-                metric: SelectionMetric::Values,
-                value: filled.to_string(),
-            },
-            SelectionStat {
-                metric: SelectionMetric::Blanks,
-                value: empty.to_string(),
-            },
-            SelectionStat {
-                metric: SelectionMetric::Distinct,
-                value: distinct.len().to_string(),
-            },
-            SelectionStat {
-                metric: SelectionMetric::Total,
-                value: total.to_string(),
-            },
-            SelectionStat {
-                metric: SelectionMetric::Minimum,
-                value: format_stat_number(*numbers.first().unwrap_or(&0.0)),
-            },
-            SelectionStat {
-                metric: SelectionMetric::Average,
-                value: format_stat_number(average),
-            },
-            SelectionStat {
-                metric: SelectionMetric::Median,
-                value: format_stat_number(median),
-            },
-            SelectionStat {
-                metric: SelectionMetric::Maximum,
-                value: format_stat_number(*numbers.last().unwrap_or(&0.0)),
-            },
-            SelectionStat {
-                metric: SelectionMetric::Summary,
-                value: format_stat_number(sum),
-            },
-        ]
-    } else {
-        vec![
-            SelectionStat {
-                metric: SelectionMetric::Values,
-                value: filled.to_string(),
-            },
-            SelectionStat {
-                metric: SelectionMetric::Blanks,
-                value: empty.to_string(),
-            },
-            SelectionStat {
-                metric: SelectionMetric::Distinct,
-                value: distinct.len().to_string(),
-            },
-            SelectionStat {
-                metric: SelectionMetric::Total,
-                value: total.to_string(),
-            },
-        ]
-    }
-}
-
-fn format_stat_number(value: f64) -> String {
-    let value = if value.abs() < 0.000_000_001 {
-        0.0
-    } else {
-        value
-    };
-    if value.fract().abs() < 0.000_000_001 {
-        return format!("{value:.0}");
-    }
-
-    let mut text = format!("{value:.4}");
-    while text.contains('.') && text.ends_with('0') {
-        text.pop();
-    }
-    if text.ends_with('.') {
-        text.pop();
-    }
-    text
-}
-
 fn plural(word: &str, count: usize) -> &'static str {
     match (word, count == 1) {
         ("cell", true) => "cell",
@@ -983,6 +674,7 @@ fn plural(word: &str, count: usize) -> &'static str {
     }
 }
 
+/// Spreadsheet-style column name for a zero-based index (0 -> A, 26 -> AA).
 fn spreadsheet_column_name(mut column: usize) -> String {
     let mut name = String::new();
     loop {
@@ -998,7 +690,9 @@ fn spreadsheet_column_name(mut column: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::stats::SelectionStat;
     use super::*;
+    use editable_csv_core::OpenOptions;
 
     fn state_with_sample() -> EditableState {
         let mut state = EditableState::default();
