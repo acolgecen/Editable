@@ -351,13 +351,14 @@ define_class!(
             &self,
             _sender: &NSApplication,
         ) -> NSApplicationTerminateReply {
-            if self
-                .ivars()
-                .state
-                .borrow()
-                .document
-                .as_ref()
-                .is_some_and(editable_csv_core::CsvDocument::is_dirty)
+            if window_delegate_is_visible(self)
+                && self
+                    .ivars()
+                    .state
+                    .borrow()
+                    .document
+                    .as_ref()
+                    .is_some_and(editable_csv_core::CsvDocument::is_dirty)
             {
                 match self.confirm_close_with_unsaved_changes() {
                     CloseChoice::Save => {
@@ -374,6 +375,9 @@ define_class!(
 
             let delegates = self.ivars().window_delegates.borrow().clone();
             for delegate in &delegates {
+                if !window_delegate_is_visible(delegate) {
+                    continue;
+                }
                 if delegate
                     .ivars()
                     .state
@@ -1309,6 +1313,9 @@ impl Delegate {
                 }
             }
             WelcomeChoice::Cancel => {}
+            WelcomeChoice::Quit => {
+                NSApplication::sharedApplication(self.mtm()).terminate(None);
+            }
         }
     }
 
@@ -3321,6 +3328,7 @@ enum WelcomeChoice {
     New,
     Open,
     Cancel,
+    Quit,
 }
 
 struct FormattingDraft {
@@ -3533,11 +3541,26 @@ fn choose_welcome_action(mtm: MainThreadMarker) -> WelcomeChoice {
     alert.addButtonWithTitle(&NSString::from_str("Create New File"));
     alert.addButtonWithTitle(&NSString::from_str("Open Existing File"));
     alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+    // Hidden 4th button captures Cmd+Q so it works while the alert modal is running.
+    alert.addButtonWithTitle(&NSString::from_str("Quit Editable"));
+    let buttons = alert.buttons();
+    if buttons.count() >= 3 {
+        let cancel_button = buttons.objectAtIndex(2);
+        cancel_button.setKeyEquivalent(&NSString::from_str("\u{1b}"));
+        cancel_button.setKeyEquivalentModifierMask(NSEventModifierFlags::empty());
+    }
+    if buttons.count() >= 4 {
+        let quit_button = buttons.objectAtIndex(3);
+        quit_button.setKeyEquivalent(&NSString::from_str("q"));
+        quit_button.setKeyEquivalentModifierMask(NSEventModifierFlags::Command);
+        quit_button.setHidden(true);
+    }
 
     match alert.runModal() {
         response if response == NSAlertFirstButtonReturn => WelcomeChoice::New,
         response if response == NSAlertSecondButtonReturn => WelcomeChoice::Open,
-        _ => WelcomeChoice::Cancel,
+        response if response == NSAlertThirdButtonReturn => WelcomeChoice::Cancel,
+        _ => WelcomeChoice::Quit,
     }
 }
 
